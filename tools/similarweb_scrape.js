@@ -509,6 +509,35 @@ async function rowExists(bq, tableId, { monthStr, country, appId, googlePackage 
   return rows.length > 0;
 }
 
+function isOverviewEmpty(m) {
+  return (
+    (m?.store_downloads == null) &&
+    (m?.mau == null) &&
+    (m?.rating_avg == null) &&
+    (m?.ratings_count == null) &&
+    (m?.ranking_text == null)
+  );
+}
+
+async function deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage }) {
+  const where = ["month = @month", "country = @country", "app_id = @app_id"];
+  const params = { month: monthStr, country, app_id: appId };
+  if (googlePackage != null) {
+    where.push("google_package = @google_package");
+    params.google_package = googlePackage;
+  } else {
+    where.push("google_package IS NULL");
+  }
+
+  const query = `
+    DELETE FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
+    WHERE ${where.join(" AND ")}
+  `;
+
+  await bq.query({ query, params });
+}
+
+
 async function existingSdkNames(bq, tableId, { monthStr, country, appId, googlePackage }) {
   const where = ["month = @month", "country = @country", "app_id = @app_id"];
   const params = { month: monthStr, country, app_id: appId };
@@ -561,7 +590,8 @@ async function fetchAndInsert({
     };
 
     const table = bq.dataset(DATASET_ID).table(tableId);
-    await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });\n    await insertRows(table, [row]);
+    await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
+    await insertRows(table, [row]);
 
     return { skipped: false, pageUrl, text, parsed };
   } catch (err) {
@@ -1176,7 +1206,8 @@ async function scrapeOverviewWithNetwork({
       );
 
       const table = bq.dataset(DATASET_ID).table(tableId);
-      await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });\n    await insertRows(table, [\n      {
+      await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
+    await insertRows(table, [\n      {
           month: monthStr,
           country,
           pulled_at: new Date().toISOString(),
@@ -1194,7 +1225,8 @@ async function scrapeOverviewWithNetwork({
       bestKind === "json" ? safeStringify(best.payload.body) : best.payload.text ? String(best.payload.text) : null;
 
     const table = bq.dataset(DATASET_ID).table(tableId);
-    await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });\n    await insertRows(table, [\n      {
+    await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
+    await insertRows(table, [\n      {
         month: monthStr,
         country,
         pulled_at: new Date().toISOString(),
@@ -1664,6 +1696,7 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
+
 
 
 
