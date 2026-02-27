@@ -1112,6 +1112,13 @@ async function scrapeOverviewWithNetwork({
     await page.waitForTimeout(6000);
     await Promise.allSettled(Array.from(responseTasks));
 
+    const finalUrl = page.url();
+    if (/\/login|signin|sign-in|\/auth/i.test(finalUrl)) {
+      const err = new Error("Similarweb session appears expired.");
+      err.code = "SW_LOGIN_EXPIRED";
+      throw err;
+    }
+
     let googlePackageHint = null;
     if (store === "apple") {
       const href = await page.evaluate(() => {
@@ -1360,15 +1367,18 @@ async function main() {
     })
   );
 
-  const http = new SimilarwebHttpClient({ cookiesPath });
+  let http = new SimilarwebHttpClient({ cookiesPath });
+  const reloginRetriedAppIds = new Set();
   const t0 = Date.now();
 
-  for (let i = resumeIndex; i < selectedAppIds.length; i += 1) {
+  appsLoop: for (let i = resumeIndex; i < selectedAppIds.length; i += 1) {
     const appId = selectedAppIds[i];
     const idx1 = i + 1;
     const appStart = Date.now();
 
     const commonQuery = { country, from: fromStr, to: toStr, window: "false" };
+
+    let retrySameApp = false;
 
     try {
       const appleOverview = await scrapeOverviewWithNetwork({
@@ -1637,8 +1647,53 @@ async function main() {
         );
       }
     } catch (err) {
-      if (
-        err?.code === "SW_LOGIN_EXPIRED" ||
+      if (err?.code === "SW_LOGIN_EXPIRED") {
+        if (reloginRetriedAppIds.has(appId)) {
+          await insertAlert(
+            bq,
+            {
+              store: null,
+              tab: null,
+              stage: "fatal",
+              app_id: appId,
+              google_package: null,
+              page_url: null,
+              error_type: err?.code,
+              error_message: formatErrorMessage(err),
+            },
+            alertsLogPath
+          );
+          await appendLine(
+            runLogPath,
+            JSON.stringify({ event: "fatal", at: nowIso(), app_id: appId, error: String(err) })
+          );
+          throw err;
+        }
+
+        reloginRetriedAppIds.add(appId);
+        await insertAlert(
+          bq,
+          {
+            store: null,
+            tab: null,
+            stage: "auth_relogin",
+            app_id: appId,
+            google_package: null,
+            page_url: null,
+            error_type: err?.code,
+            error_message: "Session expired mid-run; triggering headful relogin and retrying this app once.",
+          },
+          alertsLogPath
+        );
+        await appendLine(
+          runLogPath,
+          JSON.stringify({ event: "relogin", at: nowIso(), app_id: appId, reason: "SW_LOGIN_EXPIRED" })
+        );
+
+        await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true });
+        http = new SimilarwebHttpClient({ cookiesPath });
+        retrySameApp = true;
+      } else if (
         err?.code === "SW_BLOCKED" ||
         err?.code === "SW_TOO_MANY_429" ||
         err?.code === "SW_TOO_MANY_403"
@@ -1661,6 +1716,12 @@ async function main() {
         throw err;
       }
     } finally {
+      if (retrySameApp) {
+        i -= 1;
+        await sleep(jitter(1500, 2500));
+        continue appsLoop;
+      }
+
       const prevState = (await readJsonIfExists(statePath)) || {};
       const processedCount = Number(prevState.processed_count || 0) + 1;
       await writeJsonAtomic(statePath, {
