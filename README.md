@@ -30,8 +30,8 @@ Outputs (gitignored):
 If scraping fails with `SW_LOGIN_EXPIRED`, run login again.
 Auth expiry behavior:
 
-- The scraper (`tools/similarweb_scrape.js`) will automatically validate your session at startup.
-- If the session is expired/invalid, it will open a **headful** Playwright login window and wait for you to log in (CAPTCHA/MFA supported), then continue.
+- The scraper (`tools/similarweb_scrape.js`) automatically validates your session at startup.
+- If the session expires (startup or mid-run), it opens a **headful** Playwright login window, waits for you to log in (CAPTCHA/MFA supported), refreshes `tools/storageState.json` + `tools/cookies.json`, then retries the current app once and continues.
 
 Manual login (any time):
 
@@ -88,8 +88,7 @@ Priority tiers:
 
 Ordering within each tier:
 
-1. apps that have any `country = 'us'` row
-2. `MAX(user_rating_count)` desc per `app_id`
+- `MAX(user_rating_count)` desc per `app_id`
 
 ### Tables (BigQuery)
 
