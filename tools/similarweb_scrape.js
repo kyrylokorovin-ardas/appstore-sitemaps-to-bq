@@ -545,10 +545,7 @@ async function fetchAndInsert({
   const pageUrl = buildSimilarwebUrl(route, query);
 
   try {
-    const already = await rowExists(bq, tableId, { monthStr, country, appId, googlePackage });
-    if (already) return { skipped: true, pageUrl, text: null, parsed: null };
-
-    const { text } = await http.fetchRscText(pageUrl);
+        const { text } = await http.fetchRscText(pageUrl);
     const rawRsc = truncateForBigQueryString(text);
 
     const parsed = parser ? parser(text) : {};
@@ -564,7 +561,7 @@ async function fetchAndInsert({
     };
 
     const table = bq.dataset(DATASET_ID).table(tableId);
-    await insertRows(table, [row]);
+    await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });\n    await insertRows(table, [row]);
 
     return { skipped: false, pageUrl, text, parsed };
   } catch (err) {
@@ -938,7 +935,7 @@ function extractOverviewMetricsFromDomText(domText) {
 
 function scoreOverview(m) {
   let s = 0;
-  for (const k of ["store_downloads", "mau", "revenue_usd", "ranking_text", "rating_avg", "ratings_count"]) {
+  for (const k of ["store_downloads", "mau", "ranking_text", "rating_avg", "ratings_count"]) {
     if (m && m[k] != null) s += 1;
   }
   return s;
@@ -1001,10 +998,7 @@ async function scrapeOverviewWithNetwork({
     window: "false",
   });
 
-  const already = await rowExists(bq, tableId, { monthStr, country, appId, googlePackage });
-  if (already) return { skipped: true, pageUrl, googlePackageHint: null };
-
-  const browser = await chromium.launch({ headless: !headful });
+    const browser = await chromium.launch({ headless: !headful });
   const jsonPayloads = [];
   const rscPayloads = [];
   const responsesMeta = [];
@@ -1163,7 +1157,7 @@ async function scrapeOverviewWithNetwork({
       await fs.writeFile(debugPath, JSON.stringify(record, null, 2) + "\n", "utf8");
     }
 
-    if (!best || best.score === 0) {
+    if (!best || isOverviewEmpty(best.metrics)) {
       const urls = jsonPayloads.map((p) => p.url).slice(0, 10);
       const snippet = jsonPayloads[0]?.body ? safeStringify(jsonPayloads[0].body, 2000) : null;
       await insertAlert(
@@ -1182,8 +1176,7 @@ async function scrapeOverviewWithNetwork({
       );
 
       const table = bq.dataset(DATASET_ID).table(tableId);
-      await insertRows(table, [
-        {
+      await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });\n    await insertRows(table, [\n      {
           month: monthStr,
           country,
           pulled_at: new Date().toISOString(),
@@ -1201,8 +1194,7 @@ async function scrapeOverviewWithNetwork({
       bestKind === "json" ? safeStringify(best.payload.body) : best.payload.text ? String(best.payload.text) : null;
 
     const table = bq.dataset(DATASET_ID).table(tableId);
-    await insertRows(table, [
-      {
+    await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });\n    await insertRows(table, [\n      {
         month: monthStr,
         country,
         pulled_at: new Date().toISOString(),
@@ -1672,6 +1664,7 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
+
 
 
 
