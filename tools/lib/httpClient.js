@@ -27,8 +27,10 @@ function classifyFatalAuthIssue({ status, location, text }) {
   if (status >= 300 && status < 400 && location && /login|signin|sign-in|auth/i.test(location)) return "login_expired";
   if (status === 401) return "login_expired";
 
-  if (status === 403 && /captcha|access denied|forbidden|bot|cloudflare/.test(lower)) return "blocked";
-  if (/captcha|access denied|forbidden|unusual traffic|cloudflare/.test(lower)) return "blocked";
+  // Only treat as blocked when it really looks like a block/captcha page.
+  const blockRe = /captcha|access denied|unusual traffic|cloudflare|verify you are human|bot detection|blocked/i;
+  if ((status === 403 || status === 429) && blockRe.test(lower)) return "blocked";
+  if (status >= 400 && blockRe.test(lower)) return "blocked";
 
   if (/sign in|log in|login/.test(lower) && /password|email|continue/.test(lower)) return "login_expired";
 
@@ -115,6 +117,8 @@ export class SimilarwebHttpClient {
           const err = new Error("Similarweb access blocked (captcha / access denied). Stop and try again later.");
           err.code = "SW_BLOCKED";
           err.httpStatus = res.status;
+          err.location = location;
+          err.bodySnippet = text.slice(0, 800);
           throw err;
         }
 
