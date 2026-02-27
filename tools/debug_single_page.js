@@ -273,9 +273,9 @@ async function main() {
   const inspectPath = path.join(logsDir, `inspect_payloads_${stamp}.json`);
   const inspectNonJsonPath = path.join(logsDir, `inspect_nonjson_${stamp}.json`);
   const nextDataPath = path.join(logsDir, `next_data_${stamp}.json`);
-  const embeddedJsonPath = path.join(logsDir, embedded_json_.json);
-  const pageHtmlPath = path.join(logsDir, page_html_.html);
-  const xhrFetchPath = path.join(logsDir, xhr_fetch_.json);
+  const embeddedJsonPath = path.join(logsDir, `embedded_json_${stamp}.json`);
+  const pageHtmlPath = path.join(logsDir, `page_html_${stamp}.html`);
+  const xhrFetchPath = path.join(logsDir, `xhr_fetch_${stamp}.json`);
 
   const interestingNeedles = [
     "graphql",
