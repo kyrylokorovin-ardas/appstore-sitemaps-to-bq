@@ -870,7 +870,7 @@ function extractOverviewMetricsFromDomText(domText) {
     }
 
     // 3) Ranking text: first "Ranked in ..." sentence.
-    const rankingSentence = (block.match(/Ranked in[^\n.]+/i) || [])[0] || null;
+    const rankingSentence = (block.match(/Ranked in[^.]+/i) || [])[0] || null;
 
     // 4) Rating avg: first 0-5.x number after ranking sentence.
     let ratingAvg = null;
@@ -949,7 +949,7 @@ function extractOverviewMetricsFromDomText(domText) {
 
   return {
     store_downloads: storeDownloads ?? null,
-    ranking_text: (text.match(/Ranked in[^\n.]+/i) || [])[0] || null,
+    ranking_text: (text.match(/Ranked in[^.]+/i) || [])[0] || null,
     rating_avg: ratingAvg ?? null,
     ratings_count: ratingsCount ?? null,
     analyzed_reviews_total: null,
@@ -1184,7 +1184,7 @@ async function scrapeOverviewWithNetwork({
             ? (best?.payload?.body ? safeStringify(best.payload.body, 2000) : null)
             : (best?.payload?.text ? String(best.payload.text).slice(0, 2000) : null),
       };
-      await fs.writeFile(debugPath, JSON.stringify(record, null, 2) + "\n", "utf8");
+      await fs.writeFile(debugPath, JSON.stringify(record, null, 2) + "", "utf8");
     }
 
     if (!best || isOverviewEmpty(best.metrics)) {
@@ -1205,19 +1205,6 @@ async function scrapeOverviewWithNetwork({
         alertsLogPath
       );
 
-      const table = bq.dataset(DATASET_ID).table(tableId);
-      await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
-    await insertRows(table, [\n      {
-          month: monthStr,
-          country,
-          pulled_at: new Date().toISOString(),
-          app_id: appId,
-          google_package: googlePackage || null,
-          page_url: pageUrl,
-          raw_rsc_text: null,
-        },
-      ]);
-
       return { skipped: false, pageUrl, googlePackageHint };
     }
 
@@ -1226,7 +1213,7 @@ async function scrapeOverviewWithNetwork({
 
     const table = bq.dataset(DATASET_ID).table(tableId);
     await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
-    await insertRows(table, [\n      {
+    await insertRows(table, [      {
         month: monthStr,
         country,
         pulled_at: new Date().toISOString(),
@@ -1328,7 +1315,7 @@ async function main() {
         },
         null,
         2
-      ) + "\n"
+      ) + ""
     );
     return;
   }
@@ -1676,7 +1663,7 @@ async function main() {
         const elapsedMs = Date.now() - t0;
         const hours = elapsedMs / (1000 * 60 * 60);
         const rate = hours > 0 ? (idx1 / hours).toFixed(2) : "inf";
-        process.stdout.write(`Progress ${idx1}/${selectedAppIds.length} | ${rate} apps/hour\n`);
+        process.stdout.write(`Progress ${idx1}/${selectedAppIds.length} | ${rate} apps/hour`);
       }
 
       await appendLine(
