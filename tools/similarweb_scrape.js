@@ -1164,7 +1164,7 @@ async function scrapeOverviewWithNetwork({
       }
     }
     if (debugNetwork) {
-      const debugPath = path.join(__dirname, "..", "logs", `debug_${appId}.json`);
+      const debugPath = path.join(__dirname, "..", "logs", `debug_${store}_${appId}.json`);
       const record = {
         at: new Date().toISOString(),
         store,
@@ -1683,6 +1683,7 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
+
 
 
 
