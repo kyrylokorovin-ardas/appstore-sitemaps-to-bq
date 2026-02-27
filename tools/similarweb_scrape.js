@@ -806,85 +806,133 @@ function extractOverviewMetricsFromDomText(domText) {
     };
   }
 
-  function bestAfterLabel(labelRe, { kind = "number", min = null, max = null } = {}) {
-    const flags = labelRe.flags.includes("g") ? labelRe.flags : `${labelRe.flags}g`;
-    const re = new RegExp(labelRe.source, flags);
-    let best = null;
+  const markerRe = /Performance Overview[\s\S]{0,600}?\bApp\b[\s\S]{0,200}?\bStore\s+Downloads\b[\s\S]{0,200}?\bRanking\b[\s\S]{0,200}?\bRatings\b[\s\S]{0,200}?\bAnalyzed\s+Reviews\b[\s\S]{0,200}?\bMAU\b[\s\S]{0,200}?\bDaily\s+Stickiness\b[\s\S]{0,200}?\bRevenue\b/i;
+  const m = text.match(markerRe);
+  if (m && m.index != null) {
+    const startIdx = m.index;
+    const block = text.slice(startIdx, Math.min(text.length, startIdx + 6000));
 
-    for (const m of text.matchAll(re)) {
-      const idx = m.index == null ? -1 : m.index;
-      if (idx < 0) continue;
-      const win = text.slice(idx, Math.min(text.length, idx + 900));
+    const numTokenRe = /\b\d[\d,]*(?:\.\d+)?\s*[KMB]?\b/g;
+    const pctTokenRe = /\b\d[\d,]*(?:\.\d+)?\s*%/g;
+    const kmbTokenRe = /\b\d[\d,]*(?:\.\d+)?\s*[KMB]\b/g;
+    const ratingTokenRe = /\b[0-5](?:\.\d{1,2})\b/g;
 
-      if (kind === "rank") {
-        const mRank = win.match(/#\s*\d[\d,]*/);
-        if (mRank) return { text: mRank[0].replace(/\s+/g, ""), usd: null, n: null };
-        continue;
-      }
-
-      if (kind === "currency") {
-        const mCur = win.match(/\$\s*-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/);
-        if (mCur) {
-          const { usd, text: txt } = normalizeCurrencyUsd(mCur[0].replace(/\s+/g, ""));
-          if (!Number.isFinite(usd)) continue;
-          if (min != null && usd < min) continue;
-          if (max != null && usd > max) continue;
-          if (!best || usd > best.usd) best = { usd, text: txt };
-        }
-        continue;
-      }
-
-      if (kind === "percent") {
-        const mPct = win.match(/-?\d[\d,]*(?:\.\d+)?\s*%/);
-        if (mPct) {
-          const n = normalizeNumberText(mPct[0].replace(/%/g, ""));
-          if (!Number.isFinite(n)) continue;
-          if (min != null && n < min) continue;
-          if (max != null && n > max) continue;
-          if (!best || n > best.n) best = { n };
-        }
-        continue;
-      }
-
-      const candidates = Array.from(win.matchAll(/-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/g)).map((x) => x[0]);
-      for (const c of candidates) {
-        const pos = win.indexOf(c);
-        const around = win.slice(Math.max(0, pos - 1), Math.min(win.length, pos + c.length + 1));
-        if (/%/.test(around)) continue;
-        const n = normalizeNumberText(c);
-        if (!Number.isFinite(n)) continue;
-        if (min != null && n < min) continue;
-        if (max != null && n > max) continue;
-        if (!best || n > best.n) best = { n };
+    // 1) Store downloads: first non-percent number token after headers.
+    let storeDownloads = null;
+    for (const t of block.matchAll(numTokenRe)) {
+      const raw = t[0];
+      const pos = t.index == null ? -1 : t.index;
+      if (pos < 0) continue;
+      const around = block.slice(Math.max(0, pos - 1), Math.min(block.length, pos + raw.length + 1));
+      if (/%/.test(around)) continue;
+      const n = normalizeNumberText(raw);
+      if (Number.isFinite(n) && n >= 1) {
+        storeDownloads = n;
+        break;
       }
     }
 
-    return best;
+    // 2) Daily stickiness: first percent token.
+    let stickiness = null;
+    for (const t of block.matchAll(pctTokenRe)) {
+      const n = normalizeNumberText(String(t[0]).replace(/%/g, ""));
+      if (Number.isFinite(n) && n >= 0 && n <= 100) {
+        stickiness = n;
+        break;
+      }
+    }
+
+    // 3) Ranking text: first "Ranked in ..." sentence.
+    const rankingSentence = (block.match(/Ranked in[^\n.]+/i) || [])[0] || null;
+
+    // 4) Rating avg: first 0-5.x number after ranking sentence.
+    let ratingAvg = null;
+    const fromRating = rankingSentence ? Math.max(0, block.indexOf(rankingSentence)) : 0;
+    for (const t of block.slice(fromRating).matchAll(ratingTokenRe)) {
+      const n = normalizeNumberText(t[0]);
+      if (Number.isFinite(n) && n >= 0 && n <= 5) {
+        ratingAvg = n;
+        break;
+      }
+    }
+
+    // 5) Ratings count: first K/M/B number after rating avg.
+    let ratingsCount = null;
+    for (const t of block.slice(fromRating).matchAll(kmbTokenRe)) {
+      const n = normalizeNumberText(t[0]);
+      if (!Number.isFinite(n) || n < 1) continue;
+      if (storeDownloads != null && Math.abs(n - storeDownloads) < 0.0001) continue;
+      ratingsCount = n;
+      break;
+    }
+
+    // 6) Analyzed reviews total: first small-ish integer not equal to other metrics.
+    let analyzedTotal = null;
+    const intRe = /\b\d{1,7}\b/g;
+    for (const t of block.matchAll(intRe)) {
+      const n = Number(t[0]);
+      if (!Number.isFinite(n)) continue;
+      if (storeDownloads != null && Math.abs(n - storeDownloads) < 0.0001) continue;
+      if (ratingsCount != null && Math.abs(n - ratingsCount) < 0.0001) continue;
+      if (n >= 0 && n <= 5_000_000) {
+        analyzedTotal = n;
+        break;
+      }
+    }
+
+    // 7) MAU: largest remaining K/M/B token (usually distinct from downloads + ratings).
+    let mau = null;
+    for (const t of block.matchAll(kmbTokenRe)) {
+      const n = normalizeNumberText(t[0]);
+      if (!Number.isFinite(n) || n < 1) continue;
+      if (storeDownloads != null && Math.abs(n - storeDownloads) < 0.0001) continue;
+      if (ratingsCount != null && Math.abs(n - ratingsCount) < 0.0001) continue;
+      if (mau == null || n > mau) mau = n;
+    }
+
+    // 8) Revenue: look for $... token; otherwise N/A.
+    const mCur = block.match(/\$\s*-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/);
+    const rev = mCur ? normalizeCurrencyUsd(mCur[0].replace(/\s+/g, "")) : { usd: null, text: null };
+    const revText = rev.text || ((block.match(/\bN\/A\b/i) || [])[0] || null);
+
+    return {
+      store_downloads: storeDownloads ?? null,
+      ranking_text: rankingSentence,
+      rating_avg: ratingAvg ?? null,
+      ratings_count: ratingsCount ?? null,
+      analyzed_reviews_total: analyzedTotal ?? null,
+      analyzed_reviews_negative: null,
+      analyzed_reviews_mixed: null,
+      analyzed_reviews_positive: null,
+      mau: mau ?? null,
+      daily_stickiness_pct: stickiness ?? null,
+      revenue_usd: rev.usd ?? null,
+      revenue_text: revText,
+    };
   }
 
-  const storeDownloads = bestAfterLabel(/\bStore\s+Downloads\b/i, { kind: "number", min: 1000, max: 20e9 });
-  const mau = bestAfterLabel(/\bMAU\b/i, { kind: "number", min: 1000, max: 50e9 });
-  const revenue =
-    bestAfterLabel(/\bTotal\s+Revenue\b/i, { kind: "currency", min: 1, max: 1e12 }) ||
-    bestAfterLabel(/\bRevenue\b/i, { kind: "currency", min: 1, max: 1e12 });
-  const ranking = bestAfterLabel(/\bRanking\b/i, { kind: "rank" }) || bestAfterLabel(/\bRank\b/i, { kind: "rank" });
-  const ratingAvg = bestAfterLabel(/\bRating\b/i, { kind: "number", min: 0, max: 5 });
-  const ratingsCount = bestAfterLabel(/\bRatings\b/i, { kind: "number", min: 1, max: 1e12 });
-  const stickiness = bestAfterLabel(/\bDaily\s+Stickiness\b/i, { kind: "percent", min: 0, max: 100 });
+  // Fallback (best-effort label regex)
+  const storeDownloads = normalizeNumberText((text.match(/Store Downloads\s+([\d,.]+\s*[KMB]?)/i) || [])[1]);
+  const mau = normalizeNumberText((text.match(/\bMAU\b\s+([\d,.]+\s*[KMB]?)/) || [])[1]);
+  const stick = normalizeNumberText(((text.match(/Daily Stickiness\s+([\d,.]+)\s*%/i) || [])[1] || "").replace(/%/g, ""));
+  const ratingAvg = normalizeNumberText((text.match(/\bRating\b\s+([0-5](?:\.\d{1,2})?)/i) || [])[1]);
+  const ratingsCount = normalizeNumberText((text.match(/Ratings\s+([\d,.]+\s*[KMB]?)/i) || [])[1]);
+  const cur = (text.match(/\$\s*-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/) || [])[0] || null;
+  const rev = cur ? normalizeCurrencyUsd(cur.replace(/\s+/g, "")) : { usd: null, text: null };
 
   return {
-    store_downloads: storeDownloads?.n ?? null,
-    ranking_text: ranking?.text ?? null,
-    rating_avg: ratingAvg?.n ?? null,
-    ratings_count: ratingsCount?.n ?? null,
+    store_downloads: storeDownloads ?? null,
+    ranking_text: (text.match(/Ranked in[^\n.]+/i) || [])[0] || null,
+    rating_avg: ratingAvg ?? null,
+    ratings_count: ratingsCount ?? null,
     analyzed_reviews_total: null,
     analyzed_reviews_negative: null,
     analyzed_reviews_mixed: null,
     analyzed_reviews_positive: null,
-    mau: mau?.n ?? null,
-    daily_stickiness_pct: stickiness?.n ?? null,
-    revenue_usd: revenue?.usd ?? null,
-    revenue_text: revenue?.text ?? null,
+    mau: mau ?? null,
+    daily_stickiness_pct: stick ?? null,
+    revenue_usd: rev.usd ?? null,
+    revenue_text: rev.text ?? null,
   };
 }
 
