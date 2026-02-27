@@ -12,12 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     # CI must NOT assume local Playwright login state.
     # This job only runs when explicit secrets are provided.
-    if: >-
-      ${ {
-        secrets.GCP_SA_KEY != '' &&
-        secrets.SIMILARWEB_STORAGESTATE_B64 != '' &&
-        secrets.SIMILARWEB_COOKIES_B64 != ''
-      } }
+    if: ${{ secrets.GCP_SA_KEY != '' && secrets.SIMILARWEB_STORAGESTATE_B64 != '' && secrets.SIMILARWEB_COOKIES_B64 != '' }}
 
     steps:
       - uses: actions/checkout@v4
