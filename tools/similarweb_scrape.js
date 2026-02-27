@@ -808,7 +808,9 @@ function extractOverviewMetricsFromDomText(domText) {
 
   const markerRe = /Performance Overview[\s\S]{0,600}?\bApp\b[\s\S]{0,200}?\bStore\s+Downloads\b[\s\S]{0,200}?\bRanking\b[\s\S]{0,200}?\bRatings\b[\s\S]{0,200}?\bAnalyzed\s+Reviews\b[\s\S]{0,200}?\bMAU\b[\s\S]{0,200}?\bDaily\s+Stickiness\b[\s\S]{0,200}?\bRevenue\b/i;
   const m = text.match(markerRe);
-  if (m && m.index != null) {\n    const headerEnd = m.index + m[0].length;\n    const block = text.slice(headerEnd, Math.min(text.length, headerEnd + 6000));
+  if (m && m.index != null) {
+    const headerEnd = m.index + m[0].length;
+    const block = text.slice(headerEnd, Math.min(text.length, headerEnd + 6000));
 
     const numTokenRe = /\b\d[\d,]*(?:\.\d+)?\s*[KMB]?\b/g;
     const pctTokenRe = /\b\d[\d,]*(?:\.\d+)?\s*%/g;
@@ -1670,6 +1672,7 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
+
 
 
 
