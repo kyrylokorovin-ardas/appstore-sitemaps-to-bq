@@ -10,7 +10,7 @@ export function formatDateUTC(date) {
 }
 
 export function monthFromYyyyMm(yyyyMm) {
-  const m = String(yyyyMm || "").match(/^(\\d{4})-(\\d{2})$/);
+  const m = String(yyyyMm || "").match(/^(\d{4})-(\d{2})$/);
   if (!m) throw new Error(`Invalid --month; expected YYYY-MM, got: ${yyyyMm}`);
   const year = Number(m[1]);
   const monthIndex = Number(m[2]) - 1;
@@ -36,3 +36,4 @@ export function formatMonthYyyyMm(monthDateUtc) {
   const m = pad2(monthDateUtc.getUTCMonth() + 1);
   return `${y}-${m}`;
 }
+
