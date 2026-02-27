@@ -4,37 +4,60 @@ import { fileURLToPath } from "node:url";
 import minimist from "minimist";
 import { chromium } from "playwright";
 
-import { SimilarwebHttpClient } from "./lib/http_client.js";
+import { SimilarwebHttpClient } from "./lib/httpClient.js";
 import { createBigQueryClient, ensureTable, insertRows, sha256Hex, truncateForBigQueryString } from "./lib/bq.js";
 import { appendLine } from "./lib/logging.js";
 import { monthFromYyyyMm, previousFullMonthUtc, monthRangeUtc, formatDateUTC, formatMonthYyyyMm } from "./lib/dates.js";
 import {
-  parseDownloadsMetrics,
-  parseRevenueMetrics,
-  parseOverviewMetrics,
-  extractGooglePackageFromText,
-} from "./lib/parsers.js";
+  extractGooglePackageFromRsc,
+  parseAudience,
+  parseOverviewPerformance,
+  parseRevenueTotal,
+  parseReviewsReplyRate,
+  parseTechnographicsOverview,
+  parseTechnographicsSdks,
+  parseUsageSessions,
+} from "./lib/parser.js";
 import { readJsonIfExists, writeJsonAtomic } from "./lib/state.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const PROJECT_ID = process.env.GCP_PROJECT || "esoteric-parsec-147012";
 const DATASET_ID = process.env.BQ_DATASET || "appstore_eu";
+
+const COUNTRY_DEFAULT = 999;
 
 const TABLES = {
   map: "similarweb_app_map",
   alerts: "similarweb_alerts",
   apple: {
     overview: "similarweb_appstore_overview",
-    downloads: "similarweb_appstore_store_downloads",
+    reviews: "similarweb_appstore_reviews",
+    usage_sessions: "similarweb_appstore_usage_sessions",
+    technographics_overview: "similarweb_appstore_technographics_overview",
+    technographics_sdks: "similarweb_appstore_technographics_sdks",
     revenue: "similarweb_appstore_revenue",
+    audience: "similarweb_appstore_audience",
   },
   google: {
     overview: "similarweb_googleplay_overview",
-    downloads: "similarweb_googleplay_store_downloads",
+    reviews: "similarweb_googleplay_reviews",
+    usage_sessions: "similarweb_googleplay_usage_sessions",
+    technographics_overview: "similarweb_googleplay_technographics_overview",
+    technographics_sdks: "similarweb_googleplay_technographics_sdks",
     revenue: "similarweb_googleplay_revenue",
+    audience: "similarweb_googleplay_audience",
   },
 };
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jitter(minMs, maxMs) {
+  return minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+}
 
 function mustInt(v, name) {
   const n = Number(v);
@@ -52,201 +75,269 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-async function ensureSchema(bq) {
+function todayYyyyMmDdUtc() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+async function ensureSchemas(bq) {
   const monthPartitioning = { type: "MONTH", field: "month" };
 
-  await ensureTable(bq, DATASET_ID, TABLES.apple.overview, {
-    schema: [
+  const overviewSchema = (withGooglePackage) =>
+    [
       { name: "month", type: "DATE", mode: "REQUIRED" },
       { name: "country", type: "INT64", mode: "REQUIRED" },
       { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
       { name: "app_id", type: "INT64", mode: "REQUIRED" },
+      ...(withGooglePackage
+        ? [{ name: "google_package", type: "STRING", mode: "REQUIRED" }]
+        : [{ name: "google_package", type: "STRING", mode: "NULLABLE" }]),
+      { name: "store_downloads", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "ranking_text", type: "STRING", mode: "NULLABLE" },
+      { name: "rating_avg", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "ratings_count", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "analyzed_reviews_total", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "analyzed_reviews_negative", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "analyzed_reviews_mixed", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "analyzed_reviews_positive", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "mau", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "daily_stickiness_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "revenue_usd", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "revenue_text", type: "STRING", mode: "NULLABLE" },
       { name: "page_url", type: "STRING", mode: "REQUIRED" },
-      { name: "raw_text", type: "STRING", mode: "NULLABLE" },
-      { name: "total_downloads", type: "FLOAT64", mode: "NULLABLE" },
-      { name: "total_revenue", type: "FLOAT64", mode: "NULLABLE" },
-    ],
+      { name: "raw_rsc_text", type: "STRING", mode: "NULLABLE" },
+    ];
+
+  const reviewsSchema = (withGooglePackage) =>
+    [
+      { name: "month", type: "DATE", mode: "REQUIRED" },
+      { name: "country", type: "INT64", mode: "REQUIRED" },
+      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
+      { name: "app_id", type: "INT64", mode: "REQUIRED" },
+      ...(withGooglePackage
+        ? [{ name: "google_package", type: "STRING", mode: "REQUIRED" }]
+        : [{ name: "google_package", type: "STRING", mode: "NULLABLE" }]),
+      { name: "reply_rate_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "page_url", type: "STRING", mode: "REQUIRED" },
+      { name: "raw_rsc_text", type: "STRING", mode: "NULLABLE" },
+    ];
+
+  const usageSchema = (withGooglePackage) =>
+    [
+      { name: "month", type: "DATE", mode: "REQUIRED" },
+      { name: "country", type: "INT64", mode: "REQUIRED" },
+      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
+      { name: "app_id", type: "INT64", mode: "REQUIRED" },
+      ...(withGooglePackage
+        ? [{ name: "google_package", type: "STRING", mode: "REQUIRED" }]
+        : [{ name: "google_package", type: "STRING", mode: "NULLABLE" }]),
+      { name: "mau", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "wau", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "dau", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "daily_stickiness_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "avg_sessions_per_user", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "avg_session_time_sec", type: "INT64", mode: "NULLABLE" },
+      { name: "avg_session_time_text", type: "STRING", mode: "NULLABLE" },
+      { name: "avg_total_time_sec", type: "INT64", mode: "NULLABLE" },
+      { name: "avg_total_time_text", type: "STRING", mode: "NULLABLE" },
+      { name: "page_url", type: "STRING", mode: "REQUIRED" },
+      { name: "raw_rsc_text", type: "STRING", mode: "NULLABLE" },
+    ];
+
+  const technoOverviewSchema = (withGooglePackage) =>
+    [
+      { name: "month", type: "DATE", mode: "REQUIRED" },
+      { name: "country", type: "INT64", mode: "REQUIRED" },
+      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
+      { name: "app_id", type: "INT64", mode: "REQUIRED" },
+      ...(withGooglePackage
+        ? [{ name: "google_package", type: "STRING", mode: "REQUIRED" }]
+        : [{ name: "google_package", type: "STRING", mode: "NULLABLE" }]),
+      { name: "sdks_total", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "page_url", type: "STRING", mode: "REQUIRED" },
+      { name: "raw_rsc_text", type: "STRING", mode: "NULLABLE" },
+    ];
+
+  const technoSdksSchema = (withGooglePackage) =>
+    [
+      { name: "month", type: "DATE", mode: "REQUIRED" },
+      { name: "country", type: "INT64", mode: "REQUIRED" },
+      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
+      { name: "app_id", type: "INT64", mode: "REQUIRED" },
+      ...(withGooglePackage
+        ? [{ name: "google_package", type: "STRING", mode: "REQUIRED" }]
+        : [{ name: "google_package", type: "STRING", mode: "NULLABLE" }]),
+      { name: "sdk_name", type: "STRING", mode: "REQUIRED" },
+      { name: "sdk_category", type: "STRING", mode: "NULLABLE" },
+      { name: "installed", type: "BOOL", mode: "NULLABLE" },
+      { name: "installed_date", type: "DATE", mode: "NULLABLE" },
+      { name: "page_url", type: "STRING", mode: "REQUIRED" },
+      { name: "raw_rsc_text", type: "STRING", mode: "NULLABLE" },
+    ];
+
+  const revenueSchema = (withGooglePackage) =>
+    [
+      { name: "month", type: "DATE", mode: "REQUIRED" },
+      { name: "country", type: "INT64", mode: "REQUIRED" },
+      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
+      { name: "app_id", type: "INT64", mode: "REQUIRED" },
+      ...(withGooglePackage
+        ? [{ name: "google_package", type: "STRING", mode: "REQUIRED" }]
+        : [{ name: "google_package", type: "STRING", mode: "NULLABLE" }]),
+      { name: "total_revenue_usd", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "page_url", type: "STRING", mode: "REQUIRED" },
+      { name: "raw_rsc_text", type: "STRING", mode: "NULLABLE" },
+    ];
+
+  const audienceSchema = (withGooglePackage) =>
+    [
+      { name: "month", type: "DATE", mode: "REQUIRED" },
+      { name: "country", type: "INT64", mode: "REQUIRED" },
+      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
+      { name: "app_id", type: "INT64", mode: "REQUIRED" },
+      ...(withGooglePackage
+        ? [{ name: "google_package", type: "STRING", mode: "REQUIRED" }]
+        : [{ name: "google_package", type: "STRING", mode: "NULLABLE" }]),
+      { name: "gender_male_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "gender_female_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "age_18_24_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "age_25_34_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "age_35_44_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "age_45_54_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "age_55_plus_pct", type: "FLOAT64", mode: "NULLABLE" },
+      { name: "page_url", type: "STRING", mode: "REQUIRED" },
+      { name: "raw_rsc_text", type: "STRING", mode: "NULLABLE" },
+    ];
+
+  const alertSchema = [
+    { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
+    { name: "store", type: "STRING", mode: "NULLABLE" },
+    { name: "tab", type: "STRING", mode: "NULLABLE" },
+    { name: "stage", type: "STRING", mode: "NULLABLE" },
+    { name: "app_id", type: "INT64", mode: "NULLABLE" },
+    { name: "google_package", type: "STRING", mode: "NULLABLE" },
+    { name: "page_url", type: "STRING", mode: "NULLABLE" },
+    { name: "error_type", type: "STRING", mode: "NULLABLE" },
+    { name: "error_message", type: "STRING", mode: "NULLABLE" },
+  ];
+
+  const mapSchema = [
+    { name: "app_id", type: "INT64", mode: "REQUIRED" },
+    { name: "google_package", type: "STRING", mode: "REQUIRED" },
+    { name: "first_seen", type: "TIMESTAMP", mode: "REQUIRED" },
+    { name: "last_seen", type: "TIMESTAMP", mode: "REQUIRED" },
+    { name: "source_url", type: "STRING", mode: "NULLABLE" },
+  ];
+
+  const appleClustering = { fields: ["app_id"] };
+  const googleClustering = { fields: ["app_id", "google_package"] };
+
+  await ensureTable(bq, DATASET_ID, TABLES.apple.overview, {
+    schema: overviewSchema(false),
     timePartitioning: monthPartitioning,
-    clustering: { fields: ["app_id"] },
+    clustering: appleClustering,
+  });
+  await ensureTable(bq, DATASET_ID, TABLES.google.overview, {
+    schema: overviewSchema(true),
+    timePartitioning: monthPartitioning,
+    clustering: googleClustering,
   });
 
-  await ensureTable(bq, DATASET_ID, TABLES.apple.downloads, {
-    schema: [
-      { name: "month", type: "DATE", mode: "REQUIRED" },
-      { name: "country", type: "INT64", mode: "REQUIRED" },
-      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
-      { name: "app_id", type: "INT64", mode: "REQUIRED" },
-      { name: "page_url", type: "STRING", mode: "REQUIRED" },
-      { name: "raw_text", type: "STRING", mode: "NULLABLE" },
-      { name: "total_downloads", type: "FLOAT64", mode: "NULLABLE" },
-    ],
+  await ensureTable(bq, DATASET_ID, TABLES.apple.reviews, {
+    schema: reviewsSchema(false),
     timePartitioning: monthPartitioning,
-    clustering: { fields: ["app_id"] },
+    clustering: appleClustering,
+  });
+  await ensureTable(bq, DATASET_ID, TABLES.google.reviews, {
+    schema: reviewsSchema(true),
+    timePartitioning: monthPartitioning,
+    clustering: googleClustering,
+  });
+
+  await ensureTable(bq, DATASET_ID, TABLES.apple.usage_sessions, {
+    schema: usageSchema(false),
+    timePartitioning: monthPartitioning,
+    clustering: appleClustering,
+  });
+  await ensureTable(bq, DATASET_ID, TABLES.google.usage_sessions, {
+    schema: usageSchema(true),
+    timePartitioning: monthPartitioning,
+    clustering: googleClustering,
+  });
+
+  await ensureTable(bq, DATASET_ID, TABLES.apple.technographics_overview, {
+    schema: technoOverviewSchema(false),
+    timePartitioning: monthPartitioning,
+    clustering: appleClustering,
+  });
+  await ensureTable(bq, DATASET_ID, TABLES.google.technographics_overview, {
+    schema: technoOverviewSchema(true),
+    timePartitioning: monthPartitioning,
+    clustering: googleClustering,
+  });
+
+  await ensureTable(bq, DATASET_ID, TABLES.apple.technographics_sdks, {
+    schema: technoSdksSchema(false),
+    timePartitioning: monthPartitioning,
+    clustering: { fields: ["app_id", "sdk_name"] },
+  });
+  await ensureTable(bq, DATASET_ID, TABLES.google.technographics_sdks, {
+    schema: technoSdksSchema(true),
+    timePartitioning: monthPartitioning,
+    clustering: { fields: ["app_id", "google_package", "sdk_name"] },
   });
 
   await ensureTable(bq, DATASET_ID, TABLES.apple.revenue, {
-    schema: [
-      { name: "month", type: "DATE", mode: "REQUIRED" },
-      { name: "country", type: "INT64", mode: "REQUIRED" },
-      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
-      { name: "app_id", type: "INT64", mode: "REQUIRED" },
-      { name: "page_url", type: "STRING", mode: "REQUIRED" },
-      { name: "raw_text", type: "STRING", mode: "NULLABLE" },
-      { name: "total_revenue", type: "FLOAT64", mode: "NULLABLE" },
-    ],
+    schema: revenueSchema(false),
     timePartitioning: monthPartitioning,
-    clustering: { fields: ["app_id"] },
+    clustering: appleClustering,
+  });
+  await ensureTable(bq, DATASET_ID, TABLES.google.revenue, {
+    schema: revenueSchema(true),
+    timePartitioning: monthPartitioning,
+    clustering: googleClustering,
   });
 
-  for (const tab of ["overview", "downloads", "revenue"]) {
-    const tableId = TABLES.google[tab];
-    const common = [
-      { name: "month", type: "DATE", mode: "REQUIRED" },
-      { name: "country", type: "INT64", mode: "REQUIRED" },
-      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
-      { name: "app_id", type: "INT64", mode: "REQUIRED" },
-      { name: "google_package", type: "STRING", mode: "REQUIRED" },
-      { name: "page_url", type: "STRING", mode: "REQUIRED" },
-      { name: "raw_text", type: "STRING", mode: "NULLABLE" },
-    ];
-    let schema = common;
-    if (tab === "overview") {
-      schema = schema.concat([
-        { name: "total_downloads", type: "FLOAT64", mode: "NULLABLE" },
-        { name: "total_revenue", type: "FLOAT64", mode: "NULLABLE" },
-      ]);
-    } else if (tab === "downloads") {
-      schema = schema.concat([{ name: "total_downloads", type: "FLOAT64", mode: "NULLABLE" }]);
-    } else if (tab === "revenue") {
-      schema = schema.concat([{ name: "total_revenue", type: "FLOAT64", mode: "NULLABLE" }]);
-    }
-
-    await ensureTable(bq, DATASET_ID, tableId, {
-      schema,
-      timePartitioning: monthPartitioning,
-      clustering: { fields: ["app_id", "google_package"] },
-    });
-  }
+  await ensureTable(bq, DATASET_ID, TABLES.apple.audience, {
+    schema: audienceSchema(false),
+    timePartitioning: monthPartitioning,
+    clustering: appleClustering,
+  });
+  await ensureTable(bq, DATASET_ID, TABLES.google.audience, {
+    schema: audienceSchema(true),
+    timePartitioning: monthPartitioning,
+    clustering: googleClustering,
+  });
 
   await ensureTable(bq, DATASET_ID, TABLES.map, {
-    schema: [
-      { name: "app_id", type: "INT64", mode: "REQUIRED" },
-      { name: "google_package", type: "STRING", mode: "REQUIRED" },
-      { name: "first_seen", type: "TIMESTAMP", mode: "REQUIRED" },
-      { name: "last_seen", type: "TIMESTAMP", mode: "REQUIRED" },
-      { name: "source_url", type: "STRING", mode: "NULLABLE" },
-    ],
+    schema: mapSchema,
     clustering: { fields: ["app_id"] },
   });
 
   await ensureTable(bq, DATASET_ID, TABLES.alerts, {
-    schema: [
-      { name: "app_id", type: "INT64", mode: "NULLABLE" },
-      { name: "google_package", type: "STRING", mode: "NULLABLE" },
-      { name: "tab", type: "STRING", mode: "NULLABLE" },
-      { name: "store", type: "STRING", mode: "NULLABLE" },
-      { name: "stage", type: "STRING", mode: "NULLABLE" },
-      { name: "error_type", type: "STRING", mode: "NULLABLE" },
-      { name: "error_message", type: "STRING", mode: "NULLABLE" },
-      { name: "page_url", type: "STRING", mode: "NULLABLE" },
-      { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
-    ],
+    schema: alertSchema,
     timePartitioning: { type: "DAY", field: "pulled_at" },
     clustering: { fields: ["store", "tab", "error_type"] },
   });
 }
 
-async function insertAlert(bq, alertRow, alertsLogPath) {
-  const pulledAt = new Date().toISOString();
-  const row = { ...alertRow, pulled_at: pulledAt };
-
+async function insertAlert(bq, row, alertsLogPath) {
+  const record = { ...row, pulled_at: new Date().toISOString() };
+  await appendLine(alertsLogPath, JSON.stringify(record));
   try {
     const table = bq.dataset(DATASET_ID).table(TABLES.alerts);
-    await insertRows(table, [row]);
+    await insertRows(table, [record]);
   } catch (err) {
-    await appendLine(alertsLogPath, JSON.stringify({ ...row, bq_insert_error: String(err) }));
-    throw err;
+    await appendLine(alertsLogPath, JSON.stringify({ ...record, bq_insert_error: String(err) }));
   }
-
-  await appendLine(alertsLogPath, JSON.stringify(row));
-}
-
-async function querySelectedAppIds({ bq, monthDate, country, limit, mode }) {
-  const monthStr = formatDateUTC(monthDate);
-  const limitInt = mustInt(limit, "--limit");
-  const countryInt = mustInt(country, "--country");
-
-  const baseCte = `
-    WITH base AS (
-      SELECT DISTINCT app_id
-      FROM \`esoteric-parsec-147012.appstore_eu.app_urls_raw\`
-      WHERE app_id IS NOT NULL
-    ),
-    meta AS (
-      SELECT
-        app_id,
-        MAX(CAST(user_rating_count AS INT64)) AS max_rating_count,
-        MAX(IF(country = 'us', 1, 0)) AS has_us
-      FROM \`esoteric-parsec-147012.appstore_eu.app_metadata_by_country\`
-      GROUP BY app_id
-    ),
-    joined AS (
-      SELECT
-        b.app_id,
-        COALESCE(m.max_rating_count, 0) AS max_rating_count,
-        COALESCE(m.has_us, 0) AS has_us
-      FROM base b
-      LEFT JOIN meta m USING (app_id)
-    ),
-    already_month AS (
-      SELECT DISTINCT app_id
-      FROM \`esoteric-parsec-147012.appstore_eu.${TABLES.apple.overview}\`
-      WHERE month = @month AND country = @country
-    )
-  `;
-
-  let whereClause = "WHERE app_id NOT IN (SELECT app_id FROM already_month)";
-  let orderClause = "ORDER BY has_us DESC, max_rating_count DESC";
-
-  if (mode === "weekly") {
-    whereClause = `
-      WHERE app_id NOT IN (SELECT app_id FROM already_month)
-        AND app_id NOT IN (SELECT app_id FROM \`esoteric-parsec-147012.appstore_eu.${TABLES.map}\`)
-    `;
-    orderClause = "ORDER BY has_us DESC, max_rating_count DESC";
-  }
-
-  const query = `
-    ${baseCte}
-    SELECT app_id
-    FROM joined
-    ${whereClause}
-    ${orderClause}
-    LIMIT @limit
-  `;
-
-  const [rows] = await bq.query({
-    query,
-    params: { month: monthStr, country: countryInt, limit: limitInt },
-  });
-  return rows.map((r) => Number(r.app_id)).filter((n) => Number.isFinite(n));
-}
-
-async function lookupGooglePackageFromMap(bq, appId) {
-  const query = `
-    SELECT google_package
-    FROM \`esoteric-parsec-147012.appstore_eu.${TABLES.map}\`
-    WHERE app_id = @app_id
-    ORDER BY last_seen DESC
-    LIMIT 1
-  `;
-  const [rows] = await bq.query({ query, params: { app_id: appId } });
-  return rows[0]?.google_package || null;
 }
 
 async function upsertMapRow(bq, { appId, googlePackage, sourceUrl }) {
   const query = `
-    MERGE \`esoteric-parsec-147012.appstore_eu.${TABLES.map}\` T
+    MERGE \`${PROJECT_ID}.${DATASET_ID}.${TABLES.map}\` T
     USING (SELECT @app_id AS app_id, @google_package AS google_package, @source_url AS source_url) S
     ON T.app_id = S.app_id
     WHEN MATCHED THEN
@@ -264,9 +355,20 @@ async function upsertMapRow(bq, { appId, googlePackage, sourceUrl }) {
   });
 }
 
+async function lookupGooglePackageFromMap(bq, appId) {
+  const query = `
+    SELECT google_package
+    FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLES.map}\`
+    WHERE app_id = @app_id
+    ORDER BY last_seen DESC
+    LIMIT 1
+  `;
+  const [rows] = await bq.query({ query, params: { app_id: appId } });
+  return rows[0]?.google_package || null;
+}
+
 async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toDate }) {
   const storagePath = path.join(__dirname, "storageState.json");
-
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ storageState: storagePath });
   const page = await context.newPage();
@@ -288,65 +390,234 @@ async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toD
   });
 
   await browser.close();
-
   if (!href) return null;
   const m = String(href).match(/\/app-analysis\/overview\/google\/([^?"'\s]+)/i);
-  if (!m) return null;
-  return m[1];
+  return m ? m[1] : null;
 }
 
-async function scrapeOneTab({
+async function querySelectedAppIds({ bq, mode, limit, monthStr, country }) {
+  const limitInt = mustInt(limit, "--limit");
+  const countryInt = mustInt(country, "--country");
+
+  const sourceCte =
+    mode === "weekly"
+      ? "SELECT DISTINCT app_id FROM `esoteric-parsec-147012.appstore_eu.app_urls_raw` WHERE app_id IS NOT NULL"
+      : "SELECT DISTINCT app_id FROM `esoteric-parsec-147012.appstore_eu.app_metadata_by_country` WHERE app_id IS NOT NULL";
+
+  const query = `
+    WITH base AS (
+      ${sourceCte}
+    ),
+    meta AS (
+      SELECT
+        app_id,
+        MAX(CAST(user_rating_count AS INT64)) AS user_rating_count_max,
+        MAX(IF(country = 'us', 1, 0)) AS has_us,
+        MAX(
+          COALESCE(
+            SAFE_CAST(current_version_release_date AS DATE),
+            DATE(SAFE_CAST(current_version_release_date AS TIMESTAMP))
+          )
+        ) AS release_date
+      FROM \`esoteric-parsec-147012.appstore_eu.app_metadata_by_country\`
+      GROUP BY app_id
+    ),
+    filtered AS (
+      SELECT
+        b.app_id,
+        m.user_rating_count_max,
+        m.has_us,
+        m.release_date,
+        DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) AS days_ago,
+        CASE
+          WHEN DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) BETWEEN 0 AND 30 THEN 1
+          WHEN DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) BETWEEN 31 AND 365 THEN 2
+          ELSE 99
+        END AS tier
+      FROM base b
+      JOIN meta m USING (app_id)
+      WHERE m.release_date IS NOT NULL
+        AND DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) BETWEEN 0 AND 365
+    ),
+    already_month AS (
+      SELECT DISTINCT app_id
+      FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLES.apple.overview}\`
+      WHERE month = @month AND country = @country
+    ),
+    mapped AS (
+      SELECT DISTINCT app_id
+      FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLES.map}\`
+    )
+    SELECT app_id
+    FROM filtered
+    WHERE tier IN (1, 2)
+      AND app_id NOT IN (SELECT app_id FROM already_month)
+      ${mode === "weekly" ? "AND app_id NOT IN (SELECT app_id FROM mapped)" : ""}
+    ORDER BY tier ASC, has_us DESC, user_rating_count_max DESC
+    LIMIT @limit
+  `;
+
+  const [rows] = await bq.query({
+    query,
+    params: { month: monthStr, country: countryInt, limit: limitInt },
+  });
+  return rows.map((r) => Number(r.app_id)).filter((n) => Number.isFinite(n));
+}
+
+async function rowExists(bq, tableId, { monthStr, country, appId, googlePackage }) {
+  const where = ["month = @month", "country = @country", "app_id = @app_id"];
+  const params = { month: monthStr, country, app_id: appId };
+  if (googlePackage != null) {
+    where.push("google_package = @google_package");
+    params.google_package = googlePackage;
+  } else {
+    where.push("google_package IS NULL");
+  }
+
+  const query = `
+    SELECT 1
+    FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
+    WHERE ${where.join(" AND ")}
+    LIMIT 1
+  `;
+  const [rows] = await bq.query({ query, params });
+  return rows.length > 0;
+}
+
+async function existingSdkNames(bq, tableId, { monthStr, country, appId, googlePackage }) {
+  const where = ["month = @month", "country = @country", "app_id = @app_id"];
+  const params = { month: monthStr, country, app_id: appId };
+  if (googlePackage != null) {
+    where.push("google_package = @google_package");
+    params.google_package = googlePackage;
+  } else {
+    where.push("google_package IS NULL");
+  }
+  const query = `
+    SELECT sdk_name
+    FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
+    WHERE ${where.join(" AND ")}
+  `;
+  const [rows] = await bq.query({ query, params });
+  return new Set(rows.map((r) => String(r.sdk_name)));
+}
+
+async function fetchAndInsert({
   http,
+  bq,
+  tableId,
   store,
   tab,
-  id,
+  route,
+  query,
   monthStr,
   country,
-  fromStr,
-  toStr,
-  bqTable,
   appId,
   googlePackage,
+  parser,
   alertsLogPath,
-  bq,
 }) {
-  const route = `/app-analysis/${tab}/${store}/${id}`;
-  const pageUrl = buildSimilarwebUrl(route, { country, from: fromStr, to: toStr, window: "false" });
+  const pageUrl = buildSimilarwebUrl(route, query);
 
   try {
+    const already = await rowExists(bq, tableId, { monthStr, country, appId, googlePackage });
+    if (already) return { skipped: true, pageUrl, text: null, parsed: null };
+
     const { text } = await http.fetchRscText(pageUrl);
+    const rawRsc = truncateForBigQueryString(text);
 
-    const rawText = truncateForBigQueryString(text);
-    let metrics = {};
-    if (tab === "store-downloads") metrics = parseDownloadsMetrics(text);
-    else if (tab === "revenue") metrics = parseRevenueMetrics(text);
-    else if (tab === "overview") metrics = parseOverviewMetrics(text);
-
+    const parsed = parser ? parser(text) : {};
     const row = {
       month: monthStr,
       country,
       pulled_at: new Date().toISOString(),
       app_id: appId,
+      google_package: googlePackage || null,
+      ...parsed,
       page_url: pageUrl,
-      raw_text: rawText,
-      ...metrics,
+      raw_rsc_text: rawRsc,
     };
-    if (googlePackage) row.google_package = googlePackage;
 
-    await insertRows(bqTable, [row]);
-    return { pageUrl, text };
+    const table = bq.dataset(DATASET_ID).table(tableId);
+    await insertRows(table, [row]);
+
+    return { skipped: false, pageUrl, text, parsed };
   } catch (err) {
     await insertAlert(
       bq,
       {
+        store,
+        tab,
+        stage: "fetch_or_insert",
         app_id: appId,
         google_package: googlePackage || null,
-        tab,
-        store,
-        stage: "fetch_or_insert",
+        page_url: pageUrl,
         error_type: err?.code || "error",
         error_message: String(err?.message || err),
+      },
+      alertsLogPath
+    );
+    throw err;
+  }
+}
+
+async function scrapeTechnographicsSdks({
+  http,
+  bq,
+  store,
+  id,
+  monthStr,
+  country,
+  fromStr,
+  toStr,
+  appId,
+  googlePackage,
+  tableId,
+  alertsLogPath,
+}) {
+  const route = `/app-analysis/technographics/${store}/${id}`;
+  const pageUrl = buildSimilarwebUrl(route, { country, from: fromStr, to: toStr, window: "false" });
+
+  try {
+    const { text } = await http.fetchRscText(pageUrl);
+    const rawRsc = truncateForBigQueryString(text);
+    const rows = parseTechnographicsSdks(text);
+    if (!rows.length) return { inserted: 0, pageUrl };
+
+    const existing = await existingSdkNames(bq, tableId, { monthStr, country, appId, googlePackage });
+    const newRows = rows
+      .filter((r) => r.sdk_name && !existing.has(r.sdk_name))
+      .map((r) => ({
+        month: monthStr,
+        country,
+        pulled_at: new Date().toISOString(),
+        app_id: appId,
+        google_package: googlePackage || null,
+        sdk_name: r.sdk_name,
+        sdk_category: r.sdk_category || null,
+        installed: r.installed == null ? null : Boolean(r.installed),
+        installed_date: r.installed_date || null,
         page_url: pageUrl,
+        raw_rsc_text: rawRsc,
+      }));
+
+    if (!newRows.length) return { inserted: 0, pageUrl };
+
+    const table = bq.dataset(DATASET_ID).table(tableId);
+    await insertRows(table, newRows);
+    return { inserted: newRows.length, pageUrl };
+  } catch (err) {
+    await insertAlert(
+      bq,
+      {
+        store,
+        tab: "technographics",
+        stage: "fetch_or_insert_sdks",
+        app_id: appId,
+        google_package: googlePackage || null,
+        page_url: pageUrl,
+        error_type: err?.code || "error",
+        error_message: String(err?.message || err),
       },
       alertsLogPath
     );
@@ -356,14 +627,16 @@ async function scrapeOneTab({
 
 async function main() {
   const argv = minimist(process.argv.slice(2), {
+    boolean: ["dry_run"],
     string: ["month", "mode", "country"],
-    default: { limit: 150, mode: "backfill", country: "999" },
+    default: { limit: 150, mode: "backfill", country: String(COUNTRY_DEFAULT), dry_run: false },
   });
 
   const mode = String(argv.mode || "backfill");
   if (!["backfill", "weekly"].includes(mode)) throw new Error(`Invalid --mode: ${mode}`);
+
   const limit = mustInt(argv.limit ?? 150, "--limit");
-  const country = mustInt(argv.country ?? 999, "--country");
+  const country = mustInt(argv.country ?? COUNTRY_DEFAULT, "--country");
 
   const monthDate = argv.month ? monthFromYyyyMm(argv.month) : previousFullMonthUtc();
   const monthStr = formatDateUTC(monthDate);
@@ -371,8 +644,7 @@ async function main() {
   const fromStr = formatDateUTC(from);
   const toStr = formatDateUTC(to);
 
-  const runDate = new Date();
-  const yyyymmdd = runDate.toISOString().slice(0, 10);
+  const yyyymmdd = todayYyyyMmDdUtc();
   const alertsLogPath = path.join(__dirname, "..", "logs", `similarweb_alerts_${yyyymmdd}.log`);
   const runLogPath = path.join(__dirname, "..", "logs", `similarweb_run_${yyyymmdd}.log`);
   const statePath = path.join(__dirname, "state_similarweb.json");
@@ -383,13 +655,11 @@ async function main() {
     await fs.access(cookiesPath);
     await fs.access(storageStatePath);
   } catch {
-    throw new Error("Missing Similarweb session files. Run `node tools/similarweb_login.js` first (creates tools/cookies.json + tools/storageState.json).");
+    throw new Error("Missing Similarweb session files. Run `node tools/similarweb_login.js` first.");
   }
 
   const bq = createBigQueryClient();
-  await ensureSchema(bq);
-
-  const http = new SimilarwebHttpClient({ cookiesPath });
+  await ensureSchemas(bq);
 
   const state = (await readJsonIfExists(statePath)) || null;
   const stateMatches =
@@ -397,24 +667,41 @@ async function main() {
     state.month === monthStr &&
     state.mode === mode &&
     Number(state.country) === country &&
+    Number(state.limit) === limit &&
     Array.isArray(state.selected_app_ids);
 
-  let selectedAppIds = [];
-  if (stateMatches) {
-    selectedAppIds = state.selected_app_ids;
-  } else {
-    selectedAppIds = await querySelectedAppIds({ bq, monthDate, country, limit, mode });
-  }
+  let selectedAppIds;
+  if (stateMatches) selectedAppIds = state.selected_app_ids;
+  else selectedAppIds = await querySelectedAppIds({ bq, mode, limit, monthStr, country });
 
-  const selectedHash = sha256Hex(JSON.stringify({ month: monthStr, mode, country, selectedAppIds }));
+  const selectedHash = sha256Hex(JSON.stringify({ month: monthStr, mode, country, limit, selectedAppIds }));
   const resumeIndex = stateMatches ? Math.max(0, mustInt(state.last_index || 0, "state.last_index")) : 0;
+
+  if (argv.dry_run) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          month: monthStr,
+          mode,
+          country,
+          limit,
+          selected_count: selectedAppIds.length,
+          selected_hash: selectedHash,
+          sample_app_ids: selectedAppIds.slice(0, 20),
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    return;
+  }
 
   await writeJsonAtomic(statePath, {
     month: monthStr,
     mode,
     country,
     limit,
-    selected_app_ids_hash: selectedHash,
+    selected_hash: selectedHash,
     selected_app_ids: selectedAppIds,
     last_index: resumeIndex,
     processed_count: stateMatches ? mustInt(state.processed_count || 0, "state.processed_count") : 0,
@@ -438,96 +725,145 @@ async function main() {
     })
   );
 
-  const appleTables = {
-    overview: bq.dataset(DATASET_ID).table(TABLES.apple.overview),
-    downloads: bq.dataset(DATASET_ID).table(TABLES.apple.downloads),
-    revenue: bq.dataset(DATASET_ID).table(TABLES.apple.revenue),
-  };
-  const googleTables = {
-    overview: bq.dataset(DATASET_ID).table(TABLES.google.overview),
-    downloads: bq.dataset(DATASET_ID).table(TABLES.google.downloads),
-    revenue: bq.dataset(DATASET_ID).table(TABLES.google.revenue),
-  };
-
+  const http = new SimilarwebHttpClient({ cookiesPath });
   const t0 = Date.now();
 
   for (let i = resumeIndex; i < selectedAppIds.length; i += 1) {
     const appId = selectedAppIds[i];
-    const appStart = Date.now();
     const idx1 = i + 1;
+    const appStart = Date.now();
+
+    const commonQuery = { country, from: fromStr, to: toStr, window: "false" };
 
     try {
-      const appleOverview = await scrapeOneTab({
+      const appleOverview = await fetchAndInsert({
         http,
+        bq,
+        tableId: TABLES.apple.overview,
         store: "apple",
         tab: "overview",
-        id: String(appId),
+        route: `/app-analysis/overview/apple/${appId}`,
+        query: commonQuery,
         monthStr,
         country,
-        fromStr,
-        toStr,
-        bqTable: appleTables.overview,
         appId,
         googlePackage: null,
+        parser: (t) => parseOverviewPerformance(t),
         alertsLogPath,
-        bq,
       });
 
-      await scrapeOneTab({
+      await fetchAndInsert({
         http,
+        bq,
+        tableId: TABLES.apple.reviews,
         store: "apple",
-        tab: "store-downloads",
+        tab: "reviews",
+        route: `/app-analysis/reviews/apple/${appId}`,
+        query: commonQuery,
+        monthStr,
+        country,
+        appId,
+        googlePackage: null,
+        parser: (t) => parseReviewsReplyRate(t),
+        alertsLogPath,
+      });
+
+      await fetchAndInsert({
+        http,
+        bq,
+        tableId: TABLES.apple.usage_sessions,
+        store: "apple",
+        tab: "usage-and-engagement",
+        route: `/app-analysis/usage-and-engagement/apple/${appId}`,
+        query: commonQuery,
+        monthStr,
+        country,
+        appId,
+        googlePackage: null,
+        parser: (t) => parseUsageSessions(t),
+        alertsLogPath,
+      });
+
+      await fetchAndInsert({
+        http,
+        bq,
+        tableId: TABLES.apple.technographics_overview,
+        store: "apple",
+        tab: "technographics",
+        route: `/app-analysis/technographics/apple/${appId}`,
+        query: commonQuery,
+        monthStr,
+        country,
+        appId,
+        googlePackage: null,
+        parser: (t) => parseTechnographicsOverview(t),
+        alertsLogPath,
+      });
+
+      await scrapeTechnographicsSdks({
+        http,
+        bq,
+        store: "apple",
         id: String(appId),
         monthStr,
         country,
         fromStr,
         toStr,
-        bqTable: appleTables.downloads,
         appId,
         googlePackage: null,
+        tableId: TABLES.apple.technographics_sdks,
         alertsLogPath,
-        bq,
       });
 
-      await scrapeOneTab({
+      await fetchAndInsert({
         http,
+        bq,
+        tableId: TABLES.apple.revenue,
         store: "apple",
         tab: "revenue",
-        id: String(appId),
+        route: `/app-analysis/revenue/apple/${appId}`,
+        query: commonQuery,
         monthStr,
         country,
-        fromStr,
-        toStr,
-        bqTable: appleTables.revenue,
         appId,
         googlePackage: null,
+        parser: (t) => parseRevenueTotal(t),
         alertsLogPath,
+      });
+
+      await fetchAndInsert({
+        http,
         bq,
+        tableId: TABLES.apple.audience,
+        store: "apple",
+        tab: "audience-analysis",
+        route: `/app-analysis/audience-analysis/apple/${appId}`,
+        query: commonQuery,
+        monthStr,
+        country,
+        appId,
+        googlePackage: null,
+        parser: (t) => parseAudience(t),
+        alertsLogPath,
       });
 
       let googlePackage = await lookupGooglePackageFromMap(bq, appId);
-      if (!googlePackage) googlePackage = extractGooglePackageFromText(appleOverview.text);
-
+      if (!googlePackage && appleOverview?.text) googlePackage = extractGooglePackageFromRsc(appleOverview.text);
       if (!googlePackage) {
         try {
-          googlePackage = await resolveGooglePackageViaPlaywright({
-            appId,
-            country,
-            fromDate: from,
-            toDate: to,
-          });
+          googlePackage = await resolveGooglePackageViaPlaywright({ appId, country, fromDate: from, toDate: to });
         } catch (err) {
           await insertAlert(
             bq,
             {
+              store: "apple",
+              tab: "overview",
+              stage: "resolve_google_package",
               app_id: appId,
               google_package: null,
-              tab: "overview",
-              store: "apple",
-              stage: "resolve_google_package",
+              page_url: null,
               error_type: err?.code || "error",
               error_message: String(err?.message || err),
-              page_url: null,
             },
             alertsLogPath
           );
@@ -535,77 +871,156 @@ async function main() {
       }
 
       if (googlePackage) {
-        await upsertMapRow(bq, { appId, googlePackage, sourceUrl: appleOverview.pageUrl });
+        await upsertMapRow(bq, { appId, googlePackage, sourceUrl: appleOverview?.pageUrl || null });
 
-        await scrapeOneTab({
+        await fetchAndInsert({
           http,
+          bq,
+          tableId: TABLES.google.overview,
           store: "google",
           tab: "overview",
-          id: googlePackage,
+          route: `/app-analysis/overview/google/${googlePackage}`,
+          query: commonQuery,
           monthStr,
           country,
-          fromStr,
-          toStr,
-          bqTable: googleTables.overview,
           appId,
           googlePackage,
+          parser: (t) => parseOverviewPerformance(t),
           alertsLogPath,
-          bq,
         });
 
-        await scrapeOneTab({
+        await fetchAndInsert({
           http,
+          bq,
+          tableId: TABLES.google.reviews,
           store: "google",
-          tab: "store-downloads",
+          tab: "reviews",
+          route: `/app-analysis/reviews/google/${googlePackage}`,
+          query: commonQuery,
+          monthStr,
+          country,
+          appId,
+          googlePackage,
+          parser: (t) => parseReviewsReplyRate(t),
+          alertsLogPath,
+        });
+
+        await fetchAndInsert({
+          http,
+          bq,
+          tableId: TABLES.google.usage_sessions,
+          store: "google",
+          tab: "usage-and-engagement",
+          route: `/app-analysis/usage-and-engagement/google/${googlePackage}`,
+          query: commonQuery,
+          monthStr,
+          country,
+          appId,
+          googlePackage,
+          parser: (t) => parseUsageSessions(t),
+          alertsLogPath,
+        });
+
+        await fetchAndInsert({
+          http,
+          bq,
+          tableId: TABLES.google.technographics_overview,
+          store: "google",
+          tab: "technographics",
+          route: `/app-analysis/technographics/google/${googlePackage}`,
+          query: commonQuery,
+          monthStr,
+          country,
+          appId,
+          googlePackage,
+          parser: (t) => parseTechnographicsOverview(t),
+          alertsLogPath,
+        });
+
+        await scrapeTechnographicsSdks({
+          http,
+          bq,
+          store: "google",
           id: googlePackage,
           monthStr,
           country,
           fromStr,
           toStr,
-          bqTable: googleTables.downloads,
           appId,
           googlePackage,
+          tableId: TABLES.google.technographics_sdks,
           alertsLogPath,
-          bq,
         });
 
-        await scrapeOneTab({
+        await fetchAndInsert({
           http,
+          bq,
+          tableId: TABLES.google.revenue,
           store: "google",
           tab: "revenue",
-          id: googlePackage,
+          route: `/app-analysis/revenue/google/${googlePackage}`,
+          query: commonQuery,
           monthStr,
           country,
-          fromStr,
-          toStr,
-          bqTable: googleTables.revenue,
           appId,
           googlePackage,
+          parser: (t) => parseRevenueTotal(t),
           alertsLogPath,
+        });
+
+        await fetchAndInsert({
+          http,
           bq,
+          tableId: TABLES.google.audience,
+          store: "google",
+          tab: "audience-analysis",
+          route: `/app-analysis/audience-analysis/google/${googlePackage}`,
+          query: commonQuery,
+          monthStr,
+          country,
+          appId,
+          googlePackage,
+          parser: (t) => parseAudience(t),
+          alertsLogPath,
         });
       } else {
         await insertAlert(
           bq,
           {
+            store: "google",
+            tab: "overview",
+            stage: "resolve_google_package",
             app_id: appId,
             google_package: null,
-            tab: "overview",
-            store: "google",
-            stage: "resolve_google_package",
+            page_url: null,
             error_type: "missing_google_package",
             error_message: "Could not determine google_package from RSC or mapping",
-            page_url: null,
           },
           alertsLogPath
         );
       }
     } catch (err) {
-      if (err?.code === "SW_LOGIN_EXPIRED" || err?.code === "SW_BLOCKED") {
-        await appendLine(
-          runLogPath,
-          JSON.stringify({ event: "fatal", at: nowIso(), app_id: appId, error: String(err?.message || err) })
+      if (
+        err?.code === "SW_LOGIN_EXPIRED" ||
+        err?.code === "SW_BLOCKED" ||
+        err?.code === "SW_TOO_MANY_429" ||
+        err?.code === "SW_TOO_MANY_403"
+      ) {
+        await insertAlert(
+          bq,
+          {
+            store: null,
+            tab: null,
+            stage: "fatal",
+            app_id: appId,
+            google_package: null,
+            page_url: null,
+            error_type: err?.code,
+            error_message: String(err?.message || err),
+          },
+          alertsLogPath
         );
+        await appendLine(runLogPath, JSON.stringify({ event: "fatal", at: nowIso(), app_id: appId, error: String(err) }));
         throw err;
       }
     } finally {
@@ -618,14 +1033,19 @@ async function main() {
         updated_at: nowIso(),
       });
 
-      const elapsedMs = Date.now() - t0;
       if (idx1 % 10 === 0) {
+        const elapsedMs = Date.now() - t0;
         const hours = elapsedMs / (1000 * 60 * 60);
-        const rate = hours > 0 ? (idx1 / hours).toFixed(1) : "inf";
+        const rate = hours > 0 ? (idx1 / hours).toFixed(2) : "inf";
         process.stdout.write(`Progress ${idx1}/${selectedAppIds.length} | ${rate} apps/hour\n`);
       }
-      const appMs = Date.now() - appStart;
-      await appendLine(runLogPath, JSON.stringify({ event: "app_done", at: nowIso(), app_id: appId, ms: appMs }));
+
+      await appendLine(
+        runLogPath,
+        JSON.stringify({ event: "app_done", at: nowIso(), app_id: appId, ms: Date.now() - appStart })
+      );
+
+      await sleep(jitter(2000, 4000));
     }
   }
 
@@ -636,6 +1056,3 @@ main().catch((err) => {
   process.stderr.write(`${err?.stack || err}\n`);
   process.exitCode = 1;
 });
-
-
-
