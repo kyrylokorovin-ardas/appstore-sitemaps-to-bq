@@ -1,0 +1,17 @@
+﻿{
+  "name": "appstore-sitemaps-to-bq",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@google-cloud/bigquery": "^7.9.0",
+    "minimist": "^1.2.8",
+    "playwright": "^1.50.0"
+  },
+  "scripts": {
+    "similarweb:login": "node tools/similarweb_login.js",
+    "similarweb:scrape": "node tools/similarweb_scrape.js"
+  }
+}

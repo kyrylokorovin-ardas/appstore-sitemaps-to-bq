@@ -1,0 +1,7 @@
+﻿node_modules/
+
+tools/cookies.json
+tools/storageState.json
+tools/state_similarweb.json
+
+logs/
