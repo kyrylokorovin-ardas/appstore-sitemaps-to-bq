@@ -789,8 +789,7 @@ function extractOverviewMetricsFromText(rscText) {
 
 function extractOverviewMetricsFromDomText(domText) {
   const text = String(domText || "");
-  const lower = text.toLowerCase();
-  if (!lower) {
+  if (!text.trim()) {
     return {
       store_downloads: null,
       ranking_text: null,
@@ -807,73 +806,88 @@ function extractOverviewMetricsFromDomText(domText) {
     };
   }
 
-  function windowAfter(labelRe, n = 500) {
-    const m = text.match(labelRe);
-    if (!m) return null;
-    const idx = m.index != null ? m.index : text.toLowerCase().indexOf(String(m[0]).toLowerCase());
-    if (idx == null || idx < 0) return null;
-    return text.slice(idx, Math.min(text.length, idx + n)).replace(/\r/g, "\n");
-  }
+  function bestAfterLabel(labelRe, { kind = "number", min = null, max = null } = {}) {
+    const flags = labelRe.flags.includes("g") ? labelRe.flags : `${labelRe.flags}g`;
+    const re = new RegExp(labelRe.source, flags);
+    let best = null;
 
-  function firstNonPercentNumber(win) {
-    if (!win) return null;
-    const candidates = Array.from(win.matchAll(/-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/gi)).map((m) => m[0]);
-    for (const c of candidates) {
-      const pos = win.indexOf(c);
-      const around = win.slice(Math.max(0, pos - 1), Math.min(win.length, pos + c.length + 1));
-      if (/%/.test(around)) continue;
-      const n = normalizeNumberText(c);
-      if (Number.isFinite(n)) return n;
+    for (const m of text.matchAll(re)) {
+      const idx = m.index == null ? -1 : m.index;
+      if (idx < 0) continue;
+      const win = text.slice(idx, Math.min(text.length, idx + 900));
+
+      if (kind === "rank") {
+        const mRank = win.match(/#\s*\d[\d,]*/);
+        if (mRank) return { text: mRank[0].replace(/\s+/g, ""), usd: null, n: null };
+        continue;
+      }
+
+      if (kind === "currency") {
+        const mCur = win.match(/\$\s*-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/);
+        if (mCur) {
+          const { usd, text: txt } = normalizeCurrencyUsd(mCur[0].replace(/\s+/g, ""));
+          if (!Number.isFinite(usd)) continue;
+          if (min != null && usd < min) continue;
+          if (max != null && usd > max) continue;
+          if (!best || usd > best.usd) best = { usd, text: txt };
+        }
+        continue;
+      }
+
+      if (kind === "percent") {
+        const mPct = win.match(/-?\d[\d,]*(?:\.\d+)?\s*%/);
+        if (mPct) {
+          const n = normalizeNumberText(mPct[0].replace(/%/g, ""));
+          if (!Number.isFinite(n)) continue;
+          if (min != null && n < min) continue;
+          if (max != null && n > max) continue;
+          if (!best || n > best.n) best = { n };
+        }
+        continue;
+      }
+
+      const candidates = Array.from(win.matchAll(/-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/g)).map((x) => x[0]);
+      for (const c of candidates) {
+        const pos = win.indexOf(c);
+        const around = win.slice(Math.max(0, pos - 1), Math.min(win.length, pos + c.length + 1));
+        if (/%/.test(around)) continue;
+        const n = normalizeNumberText(c);
+        if (!Number.isFinite(n)) continue;
+        if (min != null && n < min) continue;
+        if (max != null && n > max) continue;
+        if (!best || n > best.n) best = { n };
+      }
     }
-    return null;
+
+    return best;
   }
 
-  function firstPercent(win) {
-    if (!win) return null;
-    const m = win.match(/-?\d[\d,]*(?:\.\d+)?\s*%/);
-    return m ? normalizeNumberText(m[0].replace(/%/g, "")) : null;
-  }
-
-  function firstCurrency(win) {
-    if (!win) return { usd: null, text: null };
-    const m = win.match(/\$\s*-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/);
-    if (!m) return { usd: null, text: null };
-    return normalizeCurrencyUsd(m[0].replace(/\s+/g, ""));
-  }
-
-  const storeDownloads = firstNonPercentNumber(windowAfter(/store\s+downloads/i));
-  const mau = firstNonPercentNumber(windowAfter(/\bMAU\b/i));
-
-  const dailyStickiness = firstPercent(windowAfter(/daily\s+stickiness/i)) ?? firstPercent(windowAfter(/stickiness/i));
-
-  const revenueWin = windowAfter(/total\s+revenue/i) ?? windowAfter(/\brevenue\b/i);
-  const revenue = firstCurrency(revenueWin);
-
-  const rankingWin = windowAfter(/ranking/i) ?? windowAfter(/\brank\b/i);
-  const rankingTextMatch = rankingWin ? rankingWin.match(/#\s*\d[\d,]*/i) : null;
-  const rankingText = rankingTextMatch ? rankingTextMatch[0].replace(/\s+/g, "") : null;
-
-  const ratingWin = windowAfter(/\brating\b/i);
-  const ratingAvgMatch = ratingWin ? ratingWin.match(/(^|[^\d])([0-5](?:\.\d{1,2})?)(?!\d)/) : null;
-  const ratingAvg = ratingAvgMatch ? Number(ratingAvgMatch[2]) : null;
-
-  const ratingsCount = firstNonPercentNumber(windowAfter(/ratings?\s+count/i) ?? windowAfter(/\bratings?\b/i));
+  const storeDownloads = bestAfterLabel(/\bStore\s+Downloads\b/i, { kind: "number", min: 1000, max: 20e9 });
+  const mau = bestAfterLabel(/\bMAU\b/i, { kind: "number", min: 1000, max: 50e9 });
+  const revenue =
+    bestAfterLabel(/\bTotal\s+Revenue\b/i, { kind: "currency", min: 1, max: 1e12 }) ||
+    bestAfterLabel(/\bRevenue\b/i, { kind: "currency", min: 1, max: 1e12 });
+  const ranking = bestAfterLabel(/\bRanking\b/i, { kind: "rank" }) || bestAfterLabel(/\bRank\b/i, { kind: "rank" });
+  const ratingAvg = bestAfterLabel(/\bRating\b/i, { kind: "number", min: 0, max: 5 });
+  const ratingsCount = bestAfterLabel(/\bRatings\b/i, { kind: "number", min: 1, max: 1e12 });
+  const stickiness = bestAfterLabel(/\bDaily\s+Stickiness\b/i, { kind: "percent", min: 0, max: 100 });
 
   return {
-    store_downloads: storeDownloads ?? null,
-    ranking_text: rankingText,
-    rating_avg: Number.isFinite(ratingAvg) ? ratingAvg : null,
-    ratings_count: ratingsCount ?? null,
+    store_downloads: storeDownloads?.n ?? null,
+    ranking_text: ranking?.text ?? null,
+    rating_avg: ratingAvg?.n ?? null,
+    ratings_count: ratingsCount?.n ?? null,
     analyzed_reviews_total: null,
     analyzed_reviews_negative: null,
     analyzed_reviews_mixed: null,
     analyzed_reviews_positive: null,
-    mau: mau ?? null,
-    daily_stickiness_pct: dailyStickiness ?? null,
-    revenue_usd: revenue.usd ?? null,
-    revenue_text: revenue.text ?? null,
+    mau: mau?.n ?? null,
+    daily_stickiness_pct: stickiness?.n ?? null,
+    revenue_usd: revenue?.usd ?? null,
+    revenue_text: revenue?.text ?? null,
   };
 }
+
 function scoreOverview(m) {
   let s = 0;
   for (const k of ["store_downloads", "mau", "revenue_usd", "ranking_text", "rating_avg", "ratings_count"]) {
