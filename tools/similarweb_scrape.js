@@ -426,20 +426,26 @@ async function querySelectedAppIds({ bq, mode, limit, monthStr, country }) {
   const limitInt = mustInt(limit, "--limit");
   const countryInt = mustInt(country, "--country");
 
-  const sourceCte =
-    mode === "weekly"
-      ? "SELECT DISTINCT app_id FROM `esoteric-parsec-147012.appstore_eu.app_urls_raw` WHERE app_id IS NOT NULL"
-      : "SELECT DISTINCT app_id FROM `esoteric-parsec-147012.appstore_eu.app_metadata_by_country` WHERE app_id IS NOT NULL";
-
   const query = `
-    WITH base AS (
-      ${sourceCte}
+    WITH base_meta AS (
+      SELECT DISTINCT app_id
+      FROM \`esoteric-parsec-147012.appstore_eu.app_metadata_by_country\`
+      WHERE app_id IS NOT NULL
+    ),
+    raw AS (
+      SELECT DISTINCT app_id
+      FROM \`esoteric-parsec-147012.appstore_eu.app_urls_raw\`
+      WHERE app_id IS NOT NULL
+    ),
+    base AS (
+      SELECT app_id
+      FROM base_meta
+      ${mode === "weekly" ? "WHERE app_id IN (SELECT app_id FROM raw)" : ""}
     ),
     meta AS (
       SELECT
         app_id,
         MAX(CAST(user_rating_count AS INT64)) AS user_rating_count_max,
-        MAX(IF(country = 'us', 1, 0)) AS has_us,
         MAX(
           COALESCE(
             SAFE_CAST(current_version_release_date AS DATE),
@@ -453,7 +459,6 @@ async function querySelectedAppIds({ bq, mode, limit, monthStr, country }) {
       SELECT
         b.app_id,
         m.user_rating_count_max,
-        m.has_us,
         m.release_date,
         DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) AS days_ago,
         CASE
@@ -480,7 +485,7 @@ async function querySelectedAppIds({ bq, mode, limit, monthStr, country }) {
     WHERE tier IN (1, 2)
       AND app_id NOT IN (SELECT app_id FROM already_month)
       ${mode === "weekly" ? "AND app_id NOT IN (SELECT app_id FROM mapped)" : ""}
-    ORDER BY tier ASC, has_us DESC, user_rating_count_max DESC
+    ORDER BY tier ASC, user_rating_count_max DESC
     LIMIT @limit
   `;
 
