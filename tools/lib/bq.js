@@ -21,9 +21,19 @@ function fieldKey(f) {
   return String(f.name || "").toLowerCase();
 }
 
+function canonicalType(t) {
+  const u = String(t || "").toUpperCase();
+  if (u === "INTEGER") return "INT64";
+  if (u === "FLOAT") return "FLOAT64";
+  if (u === "BOOLEAN") return "BOOL";
+  if (u === "RECORD") return "STRUCT";
+  return u;
+}
+
+
 function assertCompatibleField(existing, desired, tableId) {
-  const exType = String(existing.type || "").toUpperCase();
-  const deType = String(desired.type || "").toUpperCase();
+  const exType = canonicalType(existing.type);
+  const deType = canonicalType(desired.type);
   const exMode = String(existing.mode || "NULLABLE").toUpperCase();
   const deMode = String(desired.mode || "NULLABLE").toUpperCase();
 
