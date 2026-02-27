@@ -10,6 +10,8 @@ import { appendLine } from "./lib/logging.js";
 import { monthFromYyyyMm, previousFullMonthUtc, monthRangeUtc, formatDateUTC, formatMonthYyyyMm } from "./lib/dates.js";
 import {
   extractGooglePackageFromRsc,
+  normalizeCurrencyUsd,
+  normalizeNumberText,
   parseAudience,
   parseOverviewPerformance,
   parseRevenueTotal,
@@ -75,6 +77,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function formatErrorMessage(err) {
+  const msg = String((err && err.message) || err);
+  const status = err && err.httpStatus ? " status=" + err.httpStatus : "";
+  const loc = err && err.location ? " location=" + String(err.location).slice(0, 200) : "";
+  const snippet = err && err.bodySnippet ? " snippet=" + String(err.bodySnippet).replace(/\s+/g, " ").slice(0, 500) : "";
+  return (msg + status + loc + snippet).trim();
+}
 function todayYyyyMmDdUtc() {
   const d = new Date();
   const y = d.getUTCFullYear();
@@ -367,32 +376,37 @@ async function lookupGooglePackageFromMap(bq, appId) {
   return rows[0]?.google_package || null;
 }
 
-async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toDate }) {
+async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toDate, headful }) {
   const storagePath = path.join(__dirname, "storageState.json");
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ storageState: storagePath });
-  const page = await context.newPage();
+  const browser = await chromium.launch({ headless: !headful });
 
-  const appleUrl = buildSimilarwebUrl(`/app-analysis/overview/apple/${appId}`, {
-    country,
-    from: formatDateUTC(fromDate),
-    to: formatDateUTC(toDate),
-    window: "false",
-  });
+  try {
+    const context = await browser.newContext({ storageState: storagePath });
+    context.setDefaultTimeout(30_000);
+    const page = await context.newPage();
 
-  await page.goto(appleUrl, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(1500);
+    const appleUrl = buildSimilarwebUrl(`/app-analysis/overview/apple/${appId}`, {
+      country,
+      from: formatDateUTC(fromDate),
+      to: formatDateUTC(toDate),
+      window: "false",
+    });
 
-  const href = await page.evaluate(() => {
-    const anchors = Array.from(document.querySelectorAll("a[href]"));
-    const link = anchors.find((a) => /\/app-analysis\/overview\/google\//i.test(a.getAttribute("href") || ""));
-    return link ? link.getAttribute("href") : null;
-  });
+    await page.goto(appleUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(1500);
 
-  await browser.close();
-  if (!href) return null;
-  const m = String(href).match(/\/app-analysis\/overview\/google\/([^?"'\s]+)/i);
-  return m ? m[1] : null;
+    const href = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll("a[href]"));
+      const link = anchors.find((a) => /\/app-analysis\/overview\/google\//i.test(a.getAttribute("href") || ""));
+      return link ? link.getAttribute("href") : null;
+    });
+
+    if (!href) return null;
+    const m = String(href).match(/\/app-analysis\/overview\/google\/([^?"'\s]+)/i);
+    return m ? m[1] : null;
+  } finally {
+    await browser.close().catch(() => {});
+  }
 }
 
 async function querySelectedAppIds({ bq, mode, limit, monthStr, country }) {
@@ -553,7 +567,7 @@ async function fetchAndInsert({
         google_package: googlePackage || null,
         page_url: pageUrl,
         error_type: err?.code || "error",
-        error_message: String(err?.message || err),
+        error_message: formatErrorMessage(err),
       },
       alertsLogPath
     );
@@ -617,7 +631,7 @@ async function scrapeTechnographicsSdks({
         google_package: googlePackage || null,
         page_url: pageUrl,
         error_type: err?.code || "error",
-        error_message: String(err?.message || err),
+        error_message: formatErrorMessage(err),
       },
       alertsLogPath
     );
@@ -625,11 +639,517 @@ async function scrapeTechnographicsSdks({
   }
 }
 
+
+function safeStringify(value, maxChars = 2_000_000) {
+  try {
+    const s = JSON.stringify(value);
+    return s.length <= maxChars ? s : s.slice(0, maxChars);
+  } catch {
+    return null;
+  }
+}
+
+function isPlainObject(v) {
+  return v != null && typeof v === "object" && !Array.isArray(v);
+}
+
+function deepCollectKeyValues(root, wantedKeysLower, maxNodes = 50000) {
+  const out = new Map();
+  const stack = [root];
+  let nodes = 0;
+
+  while (stack.length) {
+    const cur = stack.pop();
+    nodes += 1;
+    if (nodes > maxNodes) break;
+
+    if (Array.isArray(cur)) {
+      for (const v of cur) stack.push(v);
+      continue;
+    }
+    if (!isPlainObject(cur)) continue;
+
+    for (const [k, v] of Object.entries(cur)) {
+      const lk = String(k).toLowerCase();
+      if (wantedKeysLower.has(lk)) {
+        if (!out.has(lk)) out.set(lk, []);
+        out.get(lk).push(v);
+      }
+      if (v != null && (typeof v === "object" || Array.isArray(v))) stack.push(v);
+    }
+  }
+
+  return out;
+}
+
+function bestNumeric(values, { min = null, max = null } = {}) {
+  let best = null;
+  for (const v of values || []) {
+    let n = null;
+    if (typeof v === "number") n = v;
+    else if (typeof v === "string") n = normalizeNumberText(v);
+    if (!Number.isFinite(n)) continue;
+    if (min != null && n < min) continue;
+    if (max != null && n > max) continue;
+    if (best == null || n > best) best = n;
+  }
+  return best;
+}
+
+function bestCurrency(values) {
+  let best = null;
+  for (const v of values || []) {
+    if (typeof v === "number" && Number.isFinite(v)) {
+      if (best == null || v > best) best = v;
+      continue;
+    }
+    if (typeof v === "string") {
+      const { usd } = normalizeCurrencyUsd(v);
+      if (usd != null && (best == null || usd > best)) best = usd;
+    }
+  }
+  return best;
+}
+
+function firstString(values) {
+  for (const v of values || []) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+function extractOverviewMetricsFromJson(body) {
+  const keys = [
+    "downloads",
+    "store_downloads",
+    "storedownloads",
+    "totaldownloads",
+    "mau",
+    "monthlyactiveusers",
+    "revenue",
+    "totalrevenue",
+    "revenueusd",
+    "rank",
+    "ranking",
+    "ranktext",
+    "rating",
+    "ratingavg",
+    "ratingscount",
+    "ratings_count",
+    "engagement",
+  ];
+  const wanted = new Set(keys.map((k) => k.toLowerCase()));
+  const found = deepCollectKeyValues(body, wanted);
+
+  const storeDownloads =
+    bestNumeric(found.get("downloads")) ??
+    bestNumeric(found.get("store_downloads")) ??
+    bestNumeric(found.get("storedownloads")) ??
+    bestNumeric(found.get("totaldownloads"));
+
+  const mau = bestNumeric(found.get("mau")) ?? bestNumeric(found.get("monthlyactiveusers"));
+
+  const revenueUsd = bestCurrency(found.get("revenue")) ?? bestCurrency(found.get("totalrevenue")) ?? bestCurrency(found.get("revenueusd"));
+
+  const rankText = firstString(found.get("ranktext"));
+  const rankNum = bestNumeric(found.get("rank")) ?? bestNumeric(found.get("ranking"));
+  const rankingText = rankText || (rankNum != null ? `#${rankNum}` : null);
+
+  const ratingAvg = bestNumeric(found.get("ratingavg"), { min: 0, max: 5 }) ?? bestNumeric(found.get("rating"), { min: 0, max: 5 });
+
+  const ratingsCount = bestNumeric(found.get("ratingscount")) ?? bestNumeric(found.get("ratings_count"));
+
+  const revenueText = firstString(found.get("revenue")) || firstString(found.get("totalrevenue")) || null;
+
+  return {
+    store_downloads: storeDownloads ?? null,
+    ranking_text: rankingText,
+    rating_avg: ratingAvg ?? null,
+    ratings_count: ratingsCount ?? null,
+    mau: mau ?? null,
+    revenue_usd: revenueUsd ?? null,
+    revenue_text: revenueText,
+  };
+}
+
+function extractOverviewMetricsFromText(rscText) {
+  return parseOverviewPerformance(rscText);
+}
+
+function extractOverviewMetricsFromDomText(domText) {
+  const text = String(domText || "");
+  const lower = text.toLowerCase();
+  if (!lower) {
+    return {
+      store_downloads: null,
+      ranking_text: null,
+      rating_avg: null,
+      ratings_count: null,
+      analyzed_reviews_total: null,
+      analyzed_reviews_negative: null,
+      analyzed_reviews_mixed: null,
+      analyzed_reviews_positive: null,
+      mau: null,
+      daily_stickiness_pct: null,
+      revenue_usd: null,
+      revenue_text: null,
+    };
+  }
+
+  function windowAfter(labelRe, n = 500) {
+    const m = text.match(labelRe);
+    if (!m) return null;
+    const idx = m.index != null ? m.index : text.toLowerCase().indexOf(String(m[0]).toLowerCase());
+    if (idx == null || idx < 0) return null;
+    return text.slice(idx, Math.min(text.length, idx + n)).replace(/\r/g, "\n");
+  }
+
+  function firstNonPercentNumber(win) {
+    if (!win) return null;
+    const candidates = Array.from(win.matchAll(/-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/gi)).map((m) => m[0]);
+    for (const c of candidates) {
+      const pos = win.indexOf(c);
+      const around = win.slice(Math.max(0, pos - 1), Math.min(win.length, pos + c.length + 1));
+      if (/%/.test(around)) continue;
+      const n = normalizeNumberText(c);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  }
+
+  function firstPercent(win) {
+    if (!win) return null;
+    const m = win.match(/-?\d[\d,]*(?:\.\d+)?\s*%/);
+    return m ? normalizeNumberText(m[0].replace(/%/g, "")) : null;
+  }
+
+  function firstCurrency(win) {
+    if (!win) return { usd: null, text: null };
+    const m = win.match(/\$\s*-?\d[\d,]*(?:\.\d+)?\s*[KMB]?/);
+    if (!m) return { usd: null, text: null };
+    return normalizeCurrencyUsd(m[0].replace(/\s+/g, ""));
+  }
+
+  const storeDownloads = firstNonPercentNumber(windowAfter(/store\s+downloads/i));
+  const mau = firstNonPercentNumber(windowAfter(/\bMAU\b/i));
+
+  const dailyStickiness = firstPercent(windowAfter(/daily\s+stickiness/i)) ?? firstPercent(windowAfter(/stickiness/i));
+
+  const revenueWin = windowAfter(/total\s+revenue/i) ?? windowAfter(/\brevenue\b/i);
+  const revenue = firstCurrency(revenueWin);
+
+  const rankingWin = windowAfter(/ranking/i) ?? windowAfter(/\brank\b/i);
+  const rankingTextMatch = rankingWin ? rankingWin.match(/#\s*\d[\d,]*/i) : null;
+  const rankingText = rankingTextMatch ? rankingTextMatch[0].replace(/\s+/g, "") : null;
+
+  const ratingWin = windowAfter(/\brating\b/i);
+  const ratingAvgMatch = ratingWin ? ratingWin.match(/(^|[^\d])([0-5](?:\.\d{1,2})?)(?!\d)/) : null;
+  const ratingAvg = ratingAvgMatch ? Number(ratingAvgMatch[2]) : null;
+
+  const ratingsCount = firstNonPercentNumber(windowAfter(/ratings?\s+count/i) ?? windowAfter(/\bratings?\b/i));
+
+  return {
+    store_downloads: storeDownloads ?? null,
+    ranking_text: rankingText,
+    rating_avg: Number.isFinite(ratingAvg) ? ratingAvg : null,
+    ratings_count: ratingsCount ?? null,
+    analyzed_reviews_total: null,
+    analyzed_reviews_negative: null,
+    analyzed_reviews_mixed: null,
+    analyzed_reviews_positive: null,
+    mau: mau ?? null,
+    daily_stickiness_pct: dailyStickiness ?? null,
+    revenue_usd: revenue.usd ?? null,
+    revenue_text: revenue.text ?? null,
+  };
+}
+function scoreOverview(m) {
+  let s = 0;
+  for (const k of ["store_downloads", "mau", "revenue_usd", "ranking_text", "rating_avg", "ratings_count"]) {
+    if (m && m[k] != null) s += 1;
+  }
+  return s;
+}
+
+function hasAnyHeuristicKey(body) {
+  const keys = ["downloads", "store_downloads", "storedownloads", "totaldownloads", "mau", "monthlyactiveusers", "revenue", "totalrevenue", "revenueusd", "rank", "ranking", "ranktext", "rating", "ratingavg", "ratingscount", "ratings_count", "engagement"];
+  const wanted = new Set(keys.map((k) => k.toLowerCase()));
+  const stack = [body];
+  let nodes = 0;
+  while (stack.length) {
+    const cur = stack.pop();
+    nodes += 1;
+    if (nodes > 20000) return false;
+    if (Array.isArray(cur)) {
+      for (const v of cur) stack.push(v);
+      continue;
+    }
+    if (!isPlainObject(cur)) continue;
+    for (const [k, v] of Object.entries(cur)) {
+      if (wanted.has(String(k).toLowerCase())) return true;
+      if (v != null && (typeof v === "object" || Array.isArray(v))) stack.push(v);
+    }
+  }
+  return false;
+}
+
+function pickBestJsonPayload(payloads) {
+  let best = null;
+  for (const p of payloads) {
+    if (!p || !p.body) continue;
+    if (!hasAnyHeuristicKey(p.body)) continue;
+    const metrics = extractOverviewMetricsFromJson(p.body);
+    const score = scoreOverview(metrics);
+    if (!best || score > best.score) best = { payload: p, metrics, score };
+  }
+  return best;
+}
+
+async function scrapeOverviewWithNetwork({
+  bq,
+  tableId,
+  store,
+  id,
+  monthStr,
+  country,
+  fromStr,
+  toStr,
+  appId,
+  googlePackage,
+  storageStatePath,
+  headful,
+  debugNetwork,
+  alertsLogPath,
+}) {
+  const pageUrl = buildSimilarwebUrl(`/app-analysis/overview/${store}/${id}`, {
+    country,
+    from: fromStr,
+    to: toStr,
+    window: "false",
+  });
+
+  const already = await rowExists(bq, tableId, { monthStr, country, appId, googlePackage });
+  if (already) return { skipped: true, pageUrl, googlePackageHint: null };
+
+  const browser = await chromium.launch({ headless: !headful });
+  const jsonPayloads = [];
+  const rscPayloads = [];
+  const responsesMeta = [];
+
+  try {
+    const context = await browser.newContext({ storageState: storageStatePath });
+    context.setDefaultTimeout(45_000);
+    const page = await context.newPage();
+
+    page.on("response", (resp) => {
+      void (async () => {
+        const url = resp.url();
+        const status = resp.status();
+        const rt = resp.request().resourceType();
+        const headers = resp.headers();
+        const ct = String(headers["content-type"] || headers["Content-Type"] || "");
+        const ctLower = ct.toLowerCase();
+
+        if (/datadoghq|browser-intake|mpps\.similarweb\.com\/track/i.test(url)) return;
+
+        if (responsesMeta.length < 200) {
+          responsesMeta.push({ url, status, resource_type: rt, content_type: ct });
+        }
+
+        const looksJson = ctLower.includes("json") || ctLower.includes("graphql") || /\.json(\\?|$)/i.test(url);
+        const looksRsc = ctLower.includes("text/x-component");
+        const isFetchLike = rt === "xhr" || rt === "fetch";
+
+        if ((looksJson || isFetchLike) && jsonPayloads.length < 60) {
+          let body = null;
+          try {
+            body = await resp.json();
+          } catch {
+            try {
+              const t = await resp.text();
+              const trimmed = t.trim();
+              if (trimmed.startsWith("{") || trimmed.startsWith("[")) body = JSON.parse(trimmed);
+            } catch {
+              body = null;
+            }
+          }
+          if (body != null) jsonPayloads.push({ url, status, body });
+        }
+
+        if (looksRsc && rscPayloads.length < 30) {
+          try {
+            const t = await resp.text();
+            if (t && t.length) rscPayloads.push({ url, status, text: t });
+          } catch {
+            // ignore
+          }
+        }
+      })().catch(() => {});
+    });
+
+    await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
+    await page.waitForSelector("text=Store Downloads", { timeout: 20_000 }).catch(() => {});
+    await page.waitForTimeout(6000);
+
+    let googlePackageHint = null;
+    if (store === "apple") {
+      const href = await page.evaluate(() => {
+        const anchors = Array.from(document.querySelectorAll("a[href]"));
+        const link = anchors.find((a) => /\/app-analysis\/overview\/google\//i.test(a.getAttribute("href") || ""));
+        return link ? link.getAttribute("href") : null;
+      });
+      if (href) {
+        const m = String(href).match(/\/app-analysis\/overview\/google\/([^?"'\s]+)/i);
+        googlePackageHint = m ? m[1] : null;
+      }
+    }
+
+    // Also capture embedded Next.js payloads (often contains the actual metrics without XHR/JSON endpoints).
+    try {
+      const nextText = await page.evaluate(() => {
+        const el = document.querySelector("script#__NEXT_DATA__");
+        return el ? el.textContent : null;
+      });
+      if (nextText) {
+        const parsed = JSON.parse(nextText);
+        if (parsed && jsonPayloads.length < 60) jsonPayloads.push({ url: "__NEXT_DATA__", status: 200, body: parsed });
+      }
+    } catch {
+      // ignore
+    }
+    let domText = null;
+    let bestDom = null;
+    try {
+      domText = await page.evaluate(() => (document && document.body ? document.body.innerText : ""));
+      const metrics = extractOverviewMetricsFromDomText(domText);
+      const score = scoreOverview(metrics);
+      bestDom = { payload: { url: "__DOM_INNERTEXT__", status: 200, text: domText }, metrics, score };
+    } catch {
+      bestDom = null;
+    }
+    const bestJson = pickBestJsonPayload(jsonPayloads);
+
+    let bestRsc = null;
+    for (const p of rscPayloads) {
+      const metrics = extractOverviewMetricsFromText(p.text);
+      const score = scoreOverview(metrics);
+      if (!bestRsc || score > bestRsc.score) bestRsc = { payload: p, metrics, score };
+    }
+
+    let best = null;
+    let bestKind = null;
+    const candidates = [
+      bestJson ? { kind: "json", ...bestJson } : null,
+      bestRsc ? { kind: "rsc", ...bestRsc } : null,
+      bestDom ? { kind: "dom", ...bestDom } : null,
+    ].filter(Boolean);
+    for (const c of candidates) {
+      if (!best || c.score > best.score) {
+        best = c;
+        bestKind = c.kind;
+      }
+    }
+    if (debugNetwork) {
+      const debugPath = path.join(__dirname, "..", "logs", `debug_${appId}.json`);
+      const record = {
+        at: new Date().toISOString(),
+        store,
+        app_id: appId,
+        google_package: googlePackage || null,
+        page_url: pageUrl,
+        responses_meta: responsesMeta,
+        captured_json_urls: jsonPayloads.map((p) => p.url),
+        captured_rsc_urls: rscPayloads.map((p) => p.url),
+        best_kind: bestKind,
+        best_url: best?.payload?.url || null,
+        best_status: best?.payload?.status || null,
+        best_metrics: best?.metrics || null,
+        best_body_snippet:
+          bestKind === "json"
+            ? (best?.payload?.body ? safeStringify(best.payload.body, 2000) : null)
+            : (best?.payload?.text ? String(best.payload.text).slice(0, 2000) : null),
+      };
+      await fs.writeFile(debugPath, JSON.stringify(record, null, 2) + "\n", "utf8");
+    }
+
+    if (!best || best.score === 0) {
+      const urls = jsonPayloads.map((p) => p.url).slice(0, 10);
+      const snippet = jsonPayloads[0]?.body ? safeStringify(jsonPayloads[0].body, 2000) : null;
+      await insertAlert(
+        bq,
+        {
+          store,
+          tab: "overview",
+          stage: "extract_json_metrics",
+          app_id: appId,
+          google_package: googlePackage || null,
+          page_url: pageUrl,
+          error_type: "metrics_not_found",
+          error_message: JSON.stringify({ json_urls: urls, sample_json_snippet: snippet }),
+        },
+        alertsLogPath
+      );
+
+      const table = bq.dataset(DATASET_ID).table(tableId);
+      await insertRows(table, [
+        {
+          month: monthStr,
+          country,
+          pulled_at: new Date().toISOString(),
+          app_id: appId,
+          google_package: googlePackage || null,
+          page_url: pageUrl,
+          raw_rsc_text: null,
+        },
+      ]);
+
+      return { skipped: false, pageUrl, googlePackageHint };
+    }
+
+    const rawText =
+      bestKind === "json" ? safeStringify(best.payload.body) : best.payload.text ? String(best.payload.text) : null;
+
+    const table = bq.dataset(DATASET_ID).table(tableId);
+    await insertRows(table, [
+      {
+        month: monthStr,
+        country,
+        pulled_at: new Date().toISOString(),
+        app_id: appId,
+        google_package: googlePackage || null,
+        ...best.metrics,
+        page_url: pageUrl,
+        raw_rsc_text: truncateForBigQueryString(rawText),
+      },
+    ]);
+
+    return { skipped: false, pageUrl, googlePackageHint };
+  } catch (err) {
+    await insertAlert(
+      bq,
+      {
+        store,
+        tab: "overview",
+        stage: "playwright_network_capture",
+        app_id: appId,
+        google_package: googlePackage || null,
+        page_url: pageUrl,
+        error_type: err?.code || "error",
+        error_message: formatErrorMessage(err),
+      },
+      alertsLogPath
+    );
+    throw err;
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
 async function main() {
   const argv = minimist(process.argv.slice(2), {
-    boolean: ["dry_run"],
+    boolean: ["dry_run", "headful", "debug_network"],
     string: ["month", "mode", "country"],
-    default: { limit: 150, mode: "backfill", country: String(COUNTRY_DEFAULT), dry_run: false },
+    default: { limit: 150, mode: "backfill", country: String(COUNTRY_DEFAULT), dry_run: false, headful: false, debug_network: false },
   });
 
   const mode = String(argv.mode || "backfill");
@@ -637,6 +1157,9 @@ async function main() {
 
   const limit = mustInt(argv.limit ?? 150, "--limit");
   const country = mustInt(argv.country ?? COUNTRY_DEFAULT, "--country");
+
+  const headful = Boolean(argv.headful);
+  const debugNetwork = Boolean(argv.debug_network);
 
   const monthDate = argv.month ? monthFromYyyyMm(argv.month) : previousFullMonthUtc();
   const monthStr = formatDateUTC(monthDate);
@@ -736,19 +1259,20 @@ async function main() {
     const commonQuery = { country, from: fromStr, to: toStr, window: "false" };
 
     try {
-      const appleOverview = await fetchAndInsert({
-        http,
+      const appleOverview = await scrapeOverviewWithNetwork({
         bq,
         tableId: TABLES.apple.overview,
         store: "apple",
-        tab: "overview",
-        route: `/app-analysis/overview/apple/${appId}`,
-        query: commonQuery,
+        id: String(appId),
         monthStr,
         country,
+        fromStr,
+        toStr,
         appId,
         googlePackage: null,
-        parser: (t) => parseOverviewPerformance(t),
+        storageStatePath,
+        headful,
+        debugNetwork,
         alertsLogPath,
       });
 
@@ -848,10 +1372,10 @@ async function main() {
       });
 
       let googlePackage = await lookupGooglePackageFromMap(bq, appId);
-      if (!googlePackage && appleOverview?.text) googlePackage = extractGooglePackageFromRsc(appleOverview.text);
+      if (!googlePackage && appleOverview?.googlePackageHint) googlePackage = appleOverview.googlePackageHint;
       if (!googlePackage) {
         try {
-          googlePackage = await resolveGooglePackageViaPlaywright({ appId, country, fromDate: from, toDate: to });
+          googlePackage = await resolveGooglePackageViaPlaywright({ appId, country, fromDate: from, toDate: to, headful });
         } catch (err) {
           await insertAlert(
             bq,
@@ -863,7 +1387,7 @@ async function main() {
               google_package: null,
               page_url: null,
               error_type: err?.code || "error",
-              error_message: String(err?.message || err),
+              error_message: formatErrorMessage(err),
             },
             alertsLogPath
           );
@@ -873,19 +1397,20 @@ async function main() {
       if (googlePackage) {
         await upsertMapRow(bq, { appId, googlePackage, sourceUrl: appleOverview?.pageUrl || null });
 
-        await fetchAndInsert({
-          http,
+        await scrapeOverviewWithNetwork({
           bq,
           tableId: TABLES.google.overview,
           store: "google",
-          tab: "overview",
-          route: `/app-analysis/overview/google/${googlePackage}`,
-          query: commonQuery,
+          id: googlePackage,
           monthStr,
           country,
+          fromStr,
+          toStr,
           appId,
           googlePackage,
-          parser: (t) => parseOverviewPerformance(t),
+          storageStatePath,
+          headful,
+          debugNetwork,
           alertsLogPath,
         });
 
@@ -1016,7 +1541,7 @@ async function main() {
             google_package: null,
             page_url: null,
             error_type: err?.code,
-            error_message: String(err?.message || err),
+            error_message: formatErrorMessage(err),
           },
           alertsLogPath
         );
@@ -1056,3 +1581,17 @@ main().catch((err) => {
   process.stderr.write(`${err?.stack || err}\n`);
   process.exitCode = 1;
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
