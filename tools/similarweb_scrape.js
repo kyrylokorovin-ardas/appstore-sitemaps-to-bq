@@ -384,6 +384,17 @@ async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toD
     const context = await browser.newContext({ storageState: storagePath });
     context.setDefaultTimeout(30_000);
     const page = await context.newPage();
+    page.on("request", (req) => {
+      try {
+        const url = req.url();
+        if (/datadoghq|browser-intake|mpps\.similarweb\.com\/track/i.test(url)) return;
+        if (requestsMeta.length < 400) {
+          requestsMeta.push({ url, method: req.method(), resource_type: req.resourceType() });
+        }
+      } catch {
+        // ignore
+      }
+    });
 
     const appleUrl = buildSimilarwebUrl(`/app-analysis/overview/apple/${appId}`, {
       country,
@@ -935,14 +946,27 @@ async function scrapeOverviewWithNetwork({
   const jsonPayloads = [];
   const rscPayloads = [];
   const responsesMeta = [];
+  const requestsMeta = [];
+  const responseTasks = new Set();
 
   try {
     const context = await browser.newContext({ storageState: storageStatePath });
     context.setDefaultTimeout(45_000);
     const page = await context.newPage();
+    page.on("request", (req) => {
+      try {
+        const url = req.url();
+        if (/datadoghq|browser-intake|mpps\.similarweb\.com\/track/i.test(url)) return;
+        if (requestsMeta.length < 400) {
+          requestsMeta.push({ url, method: req.method(), resource_type: req.resourceType() });
+        }
+      } catch {
+        // ignore
+      }
+    });
 
     page.on("response", (resp) => {
-      void (async () => {
+      const task = (async () => {
         const url = resp.url();
         const status = resp.status();
         const rt = resp.request().resourceType();
@@ -984,13 +1008,16 @@ async function scrapeOverviewWithNetwork({
             // ignore
           }
         }
-      })().catch(() => {});
+      })();
+      responseTasks.add(task);
+      void task.finally(() => responseTasks.delete(task)).catch(() => {});
     });
 
     await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
     await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
     await page.waitForSelector("text=Store Downloads", { timeout: 20_000 }).catch(() => {});
     await page.waitForTimeout(6000);
+    await Promise.allSettled(Array.from(responseTasks));
 
     let googlePackageHint = null;
     if (store === "apple") {
@@ -1058,6 +1085,7 @@ async function scrapeOverviewWithNetwork({
         app_id: appId,
         google_package: googlePackage || null,
         page_url: pageUrl,
+        requests_meta: requestsMeta,
         responses_meta: responsesMeta,
         captured_json_urls: jsonPayloads.map((p) => p.url),
         captured_rsc_urls: rscPayloads.map((p) => p.url),
@@ -1578,9 +1606,13 @@ async function main() {
 }
 
 main().catch((err) => {
-  process.stderr.write(`${err?.stack || err}\n`);
+  process.stderr.write(`${err?.stack || err}
+`);
   process.exitCode = 1;
 });
+
+
+
 
 
 
