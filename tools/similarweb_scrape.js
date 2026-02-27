@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import minimist from "minimist";
 import { chromium } from "playwright";
 
+import { ensureSimilarwebAuth } from "./lib/similarweb_auth.js";
 import { SimilarwebHttpClient } from "./lib/httpClient.js";
 import { createBigQueryClient, ensureTable, insertRows, sha256Hex, truncateForBigQueryString } from "./lib/bq.js";
 import { appendLine } from "./lib/logging.js";
@@ -336,6 +337,7 @@ async function ensureSchemas(bq) {
 async function insertAlert(bq, row, alertsLogPath) {
   const record = { ...row, pulled_at: new Date().toISOString() };
   await appendLine(alertsLogPath, JSON.stringify(record));
+
   try {
     const table = bq.dataset(DATASET_ID).table(TABLES.alerts);
     await insertRows(table, [record]);
@@ -1274,6 +1276,10 @@ async function main() {
   const statePath = path.join(__dirname, "state_similarweb.json");
   const cookiesPath = path.join(__dirname, "cookies.json");
   const storageStatePath = path.join(__dirname, "storageState.json");
+
+  // Ensure Similarweb session is valid (auto relogin headful if expired).
+  const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320?country=999&from=2026-01-01&to=2026-01-31&window=false";
+  await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true });
 
   try {
     await fs.access(cookiesPath);

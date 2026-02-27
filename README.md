@@ -28,6 +28,16 @@ Outputs (gitignored):
 - `tools/storageState.json`
 
 If scraping fails with `SW_LOGIN_EXPIRED`, run login again.
+Auth expiry behavior:
+
+- The scraper (`tools/similarweb_scrape.js`) will automatically validate your session at startup.
+- If the session is expired/invalid, it will open a **headful** Playwright login window and wait for you to log in (CAPTCHA/MFA supported), then continue.
+
+Manual login (any time):
+
+```bash
+node tools/similarweb_login.js
+```
 
 ### Run (backfill)
 
@@ -183,3 +193,4 @@ WHERE pulled_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
 ORDER BY pulled_at DESC
 LIMIT 200;
 ```
+
