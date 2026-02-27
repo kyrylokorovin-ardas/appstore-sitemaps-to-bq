@@ -1,0 +1,58 @@
+﻿name: nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 02:15 UTC daily
+    - cron: "15 2 * * *"
+
+jobs:
+  similarweb:
+    name: Similarweb scrape (optional)
+    runs-on: ubuntu-latest
+    # CI must NOT assume local Playwright login state.
+    # This job only runs when explicit secrets are provided.
+    if: >-
+      ${ {
+        secrets.GCP_SA_KEY != '' &&
+        secrets.SIMILARWEB_STORAGESTATE_B64 != '' &&
+        secrets.SIMILARWEB_COOKIES_B64 != ''
+      } }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Install Playwright (Chromium)
+        run: npx playwright install chromium
+
+      - name: Auth to Google Cloud (ADC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Restore Similarweb session artifacts
+        shell: bash
+        run: |
+          echo "$SIMILARWEB_STORAGESTATE_B64" | base64 -d > tools/storageState.json
+          echo "$SIMILARWEB_COOKIES_B64" | base64 -d > tools/cookies.json
+        env:
+          SIMILARWEB_STORAGESTATE_B64: ${{ secrets.SIMILARWEB_STORAGESTATE_B64 }}
+          SIMILARWEB_COOKIES_B64: ${{ secrets.SIMILARWEB_COOKIES_B64 }}
+
+      - name: Run Similarweb weekly scrape
+        run: node tools/similarweb_scrape.js --mode=weekly --limit=150 --country=999
+
+  noop:
+    name: Nightly (no-op)
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    steps:
+      - run: echo "Nightly workflow loaded. Similarweb job is skipped unless secrets are configured."
