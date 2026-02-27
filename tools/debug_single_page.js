@@ -273,7 +273,9 @@ async function main() {
   const inspectPath = path.join(logsDir, `inspect_payloads_${stamp}.json`);
   const inspectNonJsonPath = path.join(logsDir, `inspect_nonjson_${stamp}.json`);
   const nextDataPath = path.join(logsDir, `next_data_${stamp}.json`);
-  const embeddedJsonPath = path.join(logsDir, `embedded_json_${stamp}.json`);
+  const embeddedJsonPath = path.join(logsDir, embedded_json_.json);
+  const pageHtmlPath = path.join(logsDir, page_html_.html);
+  const xhrFetchPath = path.join(logsDir, xhr_fetch_.json);
 
   const interestingNeedles = [
     "graphql",
@@ -297,6 +299,8 @@ async function main() {
   let mainDocStatus = null;
   let mainDocCt = null;
 
+  let pageHtml = null;
+  let docExtracted = null;
   try {
     const context = await browser.newContext({ storageState: storageStatePath });
     context.setDefaultTimeout(60_000);
@@ -333,6 +337,11 @@ async function main() {
         if (lowerUrl === targetUrl.toLowerCase()) {
           mainDocStatus = status;
           mainDocCt = ct;
+          try {
+            pageHtml = await resp.text();
+          } catch {
+            pageHtml = null;
+          }
         }
 
         const isJson = ct.toLowerCase().includes("application/json") || lowerUrl.includes("graphql");
@@ -381,6 +390,21 @@ async function main() {
     await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
     await page.waitForTimeout(8000);
     await Promise.allSettled(Array.from(responseTasks));
+
+    // Dump all xhr/fetch requests (even if they don't match interesting needles)
+    const uniq = new Map();
+    for (const r of allXhrFetch) {
+      if (!uniq.has(r.url)) uniq.set(r.url, r);
+    }
+    await fs.writeFile(xhrFetchPath, JSON.stringify(Array.from(uniq.values()), null, 2) + "\n", "utf8");
+
+    if (pageHtml) {
+      await fs.writeFile(pageHtmlPath, String(pageHtml), "utf8");
+      const heur = extractFromTextHeuristics(pageHtml);
+      const score = [heur.mau, heur.revenue_usd, heur.store_downloads, heur.ranking_text, heur.rating_avg, heur.ratings_count].filter((x) => x != null)
+        .length;
+      docExtracted = { score, extracted: heur, has_metric_hints: textLooksLikeMetrics(pageHtml) };
+    }
 
     // __NEXT_DATA__
     let nextData = null;
@@ -508,10 +532,22 @@ async function main() {
       process.stdout.write(`- Blocked signals: ${JSON.stringify(blockedSignals)}\n`);
       process.stdout.write("- Top 20 interesting URLs:\n");
       for (const u of topUrls) process.stdout.write(`  - ${u.resource_type} ${u.method} ${u.url}\n`);
+
+      const uniqX = Array.from(new Map(allXhrFetch.map((x) => [x.url, x])).values()).slice(0, 20);
+      process.stdout.write("- Top 20 xhr/fetch URLs:\n");
+      for (const u of uniqX) process.stdout.write(`  - ${u.resource_type} ${u.method} ${u.url}\n`);
+
+      if (docExtracted) {
+        process.stdout.write(`- Document HTML hints: has_metric_hints=${docExtracted.has_metric_hints} score=${docExtracted.score}\n`);
+        process.stdout.write(`- Document HTML extracted (regex): ${JSON.stringify(docExtracted.extracted)}\n`);
+      }
     }
 
     process.stdout.write("\nArtifacts\n");
     process.stdout.write(`- ${path.relative(process.cwd(), inspectPath)}\n`);
+    process.stdout.write(`- ${path.relative(process.cwd(), inspectNonJsonPath)}\n`);
+    process.stdout.write(`- ${path.relative(process.cwd(), xhrFetchPath)}\n`);
+    if (pageHtml) process.stdout.write(`- ${path.relative(process.cwd(), pageHtmlPath)}\n`);
     if (nextData) process.stdout.write(`- ${path.relative(process.cwd(), nextDataPath)}\n`);
     if (embedded && embedded.length) process.stdout.write(`- ${path.relative(process.cwd(), embeddedJsonPath)}\n`);
 
@@ -529,4 +565,9 @@ main().catch((err) => {
   process.stderr.write(String(err && err.stack ? err.stack : err) + "\n");
   process.exit(1);
 });
+
+
+
+
+
 
