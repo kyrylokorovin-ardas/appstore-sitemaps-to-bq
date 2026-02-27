@@ -202,6 +202,56 @@ function analyzePayloads(payloads) {
   return scored[0] || null;
 }
 
+const METRIC_HINTS = [
+  "totalDownloads",
+  "storeDownloads",
+  "totalRevenue",
+  "revenueUsd",
+  "revenueUSD",
+  "mau",
+  "monthlyActiveUsers",
+  "ratingAvg",
+  "ratingsCount",
+  "ranking",
+  "rankText",
+  "Store Downloads",
+  "Total Revenue",
+  "MAU",
+];
+
+function textLooksLikeMetrics(t) {
+  if (!t) return false;
+  const s = String(t);
+  return METRIC_HINTS.some((h) => s.includes(h));
+}
+
+function extractFromTextHeuristics(t) {
+  const text = String(t || "");
+  const out = { mau: null, revenue_usd: null, store_downloads: null, rating_avg: null, ratings_count: null, ranking_text: null };
+
+  const mDownloads = text.match(/"(?:totalDownloads|storeDownloads|store_downloads|total_downloads)"\s*:\s*\"?(-?\d+(?:\.\d+)?)\"?/);
+  if (mDownloads) out.store_downloads = Number(mDownloads[1]);
+
+  const mMau = text.match(/"(?:mau|monthlyActiveUsers)"\s*:\s*\"?(-?\d+(?:\.\d+)?)\"?/);
+  if (mMau) out.mau = Number(mMau[1]);
+
+  const mRev = text.match(/"(?:totalRevenue|revenueUsd|revenueUSD|revenue_usd)"\s*:\s*\"?(-?\d+(?:\.\d+)?)\"?/);
+  if (mRev) out.revenue_usd = Number(mRev[1]);
+
+  const mRankText = text.match(/"(?:rankText|rankingText)"\s*:\s*"([^"]+)"/);
+  if (mRankText) out.ranking_text = mRankText[1];
+
+  const mRankNum = text.match(/"(?:rank|ranking)"\s*:\s*\"?(\d+)\"?/);
+  if (!out.ranking_text && mRankNum) out.ranking_text = `#${mRankNum[1]}`;
+
+  const mRating = text.match(/"(?:ratingAvg|rating)"\s*:\s*\"?([0-5](?:\.\d+)?)\"?/);
+  if (mRating) out.rating_avg = Number(mRating[1]);
+
+  const mRatingsCount = text.match(/"(?:ratingsCount|ratings_count)"\s*:\s*\"?(\d+(?:\.\d+)?)\"?/);
+  if (mRatingsCount) out.ratings_count = Number(mRatingsCount[1]);
+
+  return out;
+}
 async function main() {
   const argv = minimist(process.argv.slice(2), {
     boolean: ["headless"],
@@ -221,6 +271,7 @@ async function main() {
   const stamp = nowStampUtc();
 
   const inspectPath = path.join(logsDir, `inspect_payloads_${stamp}.json`);
+  const inspectNonJsonPath = path.join(logsDir, `inspect_nonjson_${stamp}.json`);
   const nextDataPath = path.join(logsDir, `next_data_${stamp}.json`);
   const embeddedJsonPath = path.join(logsDir, `embedded_json_${stamp}.json`);
 
@@ -237,7 +288,11 @@ async function main() {
 
   const browser = await chromium.launch({ headless: Boolean(argv.headless) });
   const captured = [];
+  const capturedNonJson = [];
+
   const seenInteresting = [];
+  const allXhrFetch = [];
+
 
   let mainDocStatus = null;
   let mainDocCt = null;
@@ -252,6 +307,9 @@ async function main() {
         const url = req.url();
         const rt = req.resourceType();
         const lower = url.toLowerCase();
+        if (rt === "xhr" || rt === "fetch") {
+          if (allXhrFetch.length < 800) allXhrFetch.push({ url, resource_type: rt, method: req.method() });
+        }
         if (interestingNeedles.some((n) => lower.includes(n))) {
           seenInteresting.push({ url, resource_type: rt, method: req.method() });
           if (seenInteresting.length <= 80) {
@@ -278,7 +336,10 @@ async function main() {
         }
 
         const isJson = ct.toLowerCase().includes("application/json") || lowerUrl.includes("graphql");
-        if (!isJson) return;
+        const isRsc = ct.toLowerCase().includes("text/x-component") || lowerUrl.includes("_rsc=");
+        const isFetchLike = resp.request().resourceType() === "xhr" || resp.request().resourceType() === "fetch";
+
+        if (!isJson && !isRsc && !isFetchLike) return;
 
         let body = null;
         let text = null;
@@ -396,6 +457,14 @@ async function main() {
     }
 
     const best = analyzePayloads(payloadObjs);
+    const bestTextCandidate = capturedNonJson
+      .filter((p) => p && p.extracted)
+      .map((p) => {
+        const m = p.extracted;
+        const score = [m.mau, m.revenue_usd, m.store_downloads, m.ranking_text, m.rating_avg, m.ratings_count].filter((x) => x != null).length;
+        return { url: p.url, kind: p.kind, score, extracted: m };
+      })
+      .sort((a, b) => b.score - a.score)[0] || null;
 
     const rendered = await page.evaluate(() => {
       const t = (document && document.body ? document.body.innerText : "") || "";
@@ -424,6 +493,15 @@ async function main() {
       process.stdout.write(`- JSON path for ranking: ${best.metrics.ranking_text.path || "(not found)"}\n`);
       process.stdout.write(`- JSON path for rating_avg: ${best.metrics.rating_avg.path || "(not found)"}\n`);
       process.stdout.write(`- JSON path for ratings_count: ${best.metrics.ratings_count.path || "(not found)"}\n`);
+    } else if (bestTextCandidate && bestTextCandidate.score > 0) {
+      process.stdout.write("\nSummary (from RSC/text response)\n");
+      process.stdout.write(`- Best candidate endpoint: ${bestTextCandidate.url} (${bestTextCandidate.kind})\n`);
+      process.stdout.write(`- mau (regex): ${bestTextCandidate.extracted.mau ?? "(not found)"}\n`);
+      process.stdout.write(`- revenue_usd (regex): ${bestTextCandidate.extracted.revenue_usd ?? "(not found)"}\n`);
+      process.stdout.write(`- downloads (regex): ${bestTextCandidate.extracted.store_downloads ?? "(not found)"}\n`);
+      process.stdout.write(`- ranking_text (regex): ${bestTextCandidate.extracted.ranking_text ?? "(not found)"}\n`);
+      process.stdout.write(`- rating_avg (regex): ${bestTextCandidate.extracted.rating_avg ?? "(not found)"}\n`);
+      process.stdout.write(`- ratings_count (regex): ${bestTextCandidate.extracted.ratings_count ?? "(not found)"}\n`);
     } else {
       process.stdout.write("\nMetrics not found in JSON/Next/embedded.\n");
       process.stdout.write(`- Rendered visually? labels=${rendered.hasLabel} numbers=${rendered.hasNumber}\n`);
@@ -451,3 +529,4 @@ main().catch((err) => {
   process.stderr.write(String(err && err.stack ? err.stack : err) + "\n");
   process.exit(1);
 });
+
