@@ -32,6 +32,7 @@ Auth expiry behavior:
 
 - The scraper (`tools/similarweb_scrape.js`) automatically validates your session at startup.
 - If the session expires (startup or mid-run), it opens a **headful** Playwright login window, waits for you to log in (CAPTCHA/MFA supported), refreshes `tools/storageState.json` + `tools/cookies.json`, then retries the current app once and continues.
+- If Similarweb pages are slow to load, the scraper retries the same app a few times with backoff; persistent timeouts create an alert and the app will be retried in the next run.
 
 Manual login (any time):
 
@@ -75,6 +76,11 @@ node tools/similarweb_scrape.js --dry_run --mode=backfill --limit=150 --country=
 ### App selection logic
 
 Primary selection source: `esoteric-parsec-147012.appstore_eu.app_metadata_by_country`.
+
+Skip already processed:
+
+- For each run, we select only `app_id` values that are **missing** in `similarweb_appstore_overview` for the given `(month, country)` (LEFT JOIN + `WHERE overview.app_id IS NULL`).
+- This makes backfill idempotent and restart-safe: if the script crashes, the next run automatically continues with remaining missing apps.
 
 Filters:
 

@@ -54,6 +54,24 @@ const TABLES = {
   },
 };
 
+function isPlaywrightTimeout(err) {
+  const msg = String(err?.message || err || "");
+  return err?.name === "TimeoutError" || /timeout/i.test(msg);
+}
+
+async function sniffAuthOrBlocked(page) {
+  try {
+    const u = String(page?.url?.() || "");
+    if (/\/login|signin|sign-in|\/auth/i.test(u)) return "login";
+  } catch {}
+  try {
+    const t = await page.evaluate(() => (document && document.body ? document.body.innerText : ""));
+    const low = String(t || "").toLowerCase();
+    if (low.includes("access denied") || low.includes("captcha") || low.includes("verify you are human")) return "blocked";
+    if (low.includes("sign in") || low.includes("log in") || low.includes("login")) return "login";
+  } catch {}
+  return "unknown";
+}
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -433,23 +451,49 @@ async function queryProcessedAlreadyCount({ bq, monthStr, country }) {
   return Number(rows?.[0]?.c ?? 0);
 }
 async function querySelectedAppIds({ bq, mode, limit, monthStr, country }) {
+  void mode;
   const limitInt = mustInt(limit, "--limit");
   const countryInt = mustInt(country, "--country");
 
   const query = `
-    WITH m AS (
-      SELECT DISTINCT app_id
+    WITH meta AS (
+      SELECT
+        app_id,
+        MAX(CAST(user_rating_count AS INT64)) AS user_rating_count_max,
+        MAX(
+          COALESCE(
+            SAFE_CAST(current_version_release_date AS DATE),
+            DATE(SAFE_CAST(current_version_release_date AS TIMESTAMP))
+          )
+        ) AS release_date
       FROM \`${PROJECT_ID}.${DATASET_ID}.app_metadata_by_country\`
       WHERE app_id IS NOT NULL
+      GROUP BY app_id
+    ),
+    candidates AS (
+      SELECT
+        app_id,
+        user_rating_count_max,
+        release_date,
+        DATE_DIFF(CURRENT_DATE('UTC'), release_date, DAY) AS days_ago,
+        CASE
+          WHEN DATE_DIFF(CURRENT_DATE('UTC'), release_date, DAY) BETWEEN 0 AND 30 THEN 1
+          WHEN DATE_DIFF(CURRENT_DATE('UTC'), release_date, DAY) BETWEEN 31 AND 365 THEN 2
+          ELSE 99
+        END AS tier
+      FROM meta
+      WHERE release_date IS NOT NULL
+        AND DATE_DIFF(CURRENT_DATE('UTC'), release_date, DAY) BETWEEN 0 AND 365
     )
-    SELECT m.app_id
-    FROM m
+    SELECT c.app_id
+    FROM candidates c
     LEFT JOIN \`${PROJECT_ID}.${DATASET_ID}.${TABLES.apple.overview}\` s
-      ON s.app_id = m.app_id
+      ON s.app_id = c.app_id
      AND s.month = @month
      AND s.country = @country
     WHERE s.app_id IS NULL
-    ORDER BY m.app_id
+      AND c.tier IN (1, 2)
+    ORDER BY c.tier ASC, c.user_rating_count_max DESC, c.app_id ASC
     LIMIT @limit
   `;
 
@@ -1069,12 +1113,75 @@ async function scrapeOverviewWithNetwork({
       responseTasks.add(task);
       void task.finally(() => responseTasks.delete(task)).catch(() => {});
     });
+    const gotoBackoffs = [5000, 15000];
+    let navigated = false;
 
-    await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
-    await page.waitForSelector("text=Store Downloads", { timeout: 20_000 }).catch(() => {});
-    await page.waitForTimeout(6000);
-    await Promise.allSettled(Array.from(responseTasks));
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
+        await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
+        await page.waitForSelector("text=Store Downloads", { timeout: 45_000 }).catch(() => {});
+        await page.waitForTimeout(6000);
+        await Promise.allSettled(Array.from(responseTasks));
+        navigated = true;
+        break;
+      } catch (err) {
+        if (!isPlaywrightTimeout(err)) throw err;
+
+        // Retry timeouts a couple times with backoff.
+        if (attempt < 2) {
+          await sleep(gotoBackoffs[attempt]);
+          continue;
+        }
+
+        const hint = await sniffAuthOrBlocked(page);
+        if (hint === "login") {
+          const e = new Error("Similarweb session appears expired.");
+          e.code = "SW_LOGIN_EXPIRED";
+          throw e;
+        }
+        if (hint === "blocked") {
+          const e = new Error("Similarweb access blocked (captcha / access denied).");
+          e.code = "SW_BLOCKED";
+          throw e;
+        }
+
+        await insertAlert(
+          bq,
+          {
+            store,
+            tab: "overview",
+            stage: "playwright_navigation_timeout",
+            app_id: appId,
+            google_package: googlePackage || null,
+            page_url: pageUrl,
+            error_type: "timeout",
+            error_message: "Timeout loading Similarweb overview page after retries",
+          },
+          alertsLogPath
+        );
+        return { skipped: true, pageUrl, googlePackageHint: null };
+      }
+    }
+
+    if (!navigated) {
+      await insertAlert(
+        bq,
+        {
+          store,
+          tab: "overview",
+          stage: "playwright_navigation_timeout",
+          app_id: appId,
+          google_package: googlePackage || null,
+          page_url: pageUrl,
+          error_type: "timeout",
+          error_message: "Failed to navigate Similarweb overview page",
+        },
+        alertsLogPath
+      );
+      return { skipped: true, pageUrl, googlePackageHint: null };
+    }
+
 
     const finalUrl = page.url();
     if (/\/login|signin|sign-in|\/auth/i.test(finalUrl)) {
