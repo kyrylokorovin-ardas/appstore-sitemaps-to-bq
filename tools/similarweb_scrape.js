@@ -422,70 +422,34 @@ async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toD
   }
 }
 
+async function queryProcessedAlreadyCount({ bq, monthStr, country }) {
+  const countryInt = mustInt(country, "--country");
+  const query = `
+    SELECT COUNT(DISTINCT app_id) AS c
+    FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLES.apple.overview}\`
+    WHERE month = @month AND country = @country
+  `;
+  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt } });
+  return Number(rows?.[0]?.c ?? 0);
+}
 async function querySelectedAppIds({ bq, mode, limit, monthStr, country }) {
   const limitInt = mustInt(limit, "--limit");
   const countryInt = mustInt(country, "--country");
 
   const query = `
-    WITH base_meta AS (
+    WITH m AS (
       SELECT DISTINCT app_id
-      FROM \`esoteric-parsec-147012.appstore_eu.app_metadata_by_country\`
+      FROM \`${PROJECT_ID}.${DATASET_ID}.app_metadata_by_country\`
       WHERE app_id IS NOT NULL
-    ),
-    raw AS (
-      SELECT DISTINCT app_id
-      FROM \`esoteric-parsec-147012.appstore_eu.app_urls_raw\`
-      WHERE app_id IS NOT NULL
-    ),
-    base AS (
-      SELECT app_id
-      FROM base_meta
-      ${mode === "weekly" ? "WHERE app_id IN (SELECT app_id FROM raw)" : ""}
-    ),
-    meta AS (
-      SELECT
-        app_id,
-        MAX(CAST(user_rating_count AS INT64)) AS user_rating_count_max,
-        MAX(
-          COALESCE(
-            SAFE_CAST(current_version_release_date AS DATE),
-            DATE(SAFE_CAST(current_version_release_date AS TIMESTAMP))
-          )
-        ) AS release_date
-      FROM \`esoteric-parsec-147012.appstore_eu.app_metadata_by_country\`
-      GROUP BY app_id
-    ),
-    filtered AS (
-      SELECT
-        b.app_id,
-        m.user_rating_count_max,
-        m.release_date,
-        DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) AS days_ago,
-        CASE
-          WHEN DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) BETWEEN 0 AND 30 THEN 1
-          WHEN DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) BETWEEN 31 AND 365 THEN 2
-          ELSE 99
-        END AS tier
-      FROM base b
-      JOIN meta m USING (app_id)
-      WHERE m.release_date IS NOT NULL
-        AND DATE_DIFF(CURRENT_DATE('UTC'), m.release_date, DAY) BETWEEN 0 AND 365
-    ),
-    already_month AS (
-      SELECT DISTINCT app_id
-      FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLES.apple.overview}\`
-      WHERE month = @month AND country = @country
-    ),
-    mapped AS (
-      SELECT DISTINCT app_id
-      FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLES.map}\`
     )
-    SELECT app_id
-    FROM filtered
-    WHERE tier IN (1, 2)
-      AND app_id NOT IN (SELECT app_id FROM already_month)
-      ${mode === "weekly" ? "AND app_id NOT IN (SELECT app_id FROM mapped)" : ""}
-    ORDER BY tier ASC, user_rating_count_max DESC
+    SELECT m.app_id
+    FROM m
+    LEFT JOIN \`${PROJECT_ID}.${DATASET_ID}.${TABLES.apple.overview}\` s
+      ON s.app_id = m.app_id
+     AND s.month = @month
+     AND s.country = @country
+    WHERE s.app_id IS NULL
+    ORDER BY m.app_id
     LIMIT @limit
   `;
 
@@ -1285,7 +1249,6 @@ async function main() {
   const yyyymmdd = todayYyyyMmDdUtc();
   const alertsLogPath = path.join(__dirname, "..", "logs", `similarweb_alerts_${yyyymmdd}.log`);
   const runLogPath = path.join(__dirname, "..", "logs", `similarweb_run_${yyyymmdd}.log`);
-  const statePath = path.join(__dirname, "state_similarweb.json");
   const cookiesPath = path.join(__dirname, "cookies.json");
   const storageStatePath = path.join(__dirname, "storageState.json");
 
@@ -1302,22 +1265,9 @@ async function main() {
 
   const bq = createBigQueryClient();
   await ensureSchemas(bq);
+  const processedAlreadyCount = await queryProcessedAlreadyCount({ bq, monthStr, country });
 
-  const state = (await readJsonIfExists(statePath)) || null;
-  const stateMatches =
-    state &&
-    state.month === monthStr &&
-    state.mode === mode &&
-    Number(state.country) === country &&
-    Number(state.limit) === limit &&
-    Array.isArray(state.selected_app_ids);
-
-  let selectedAppIds;
-  if (stateMatches) selectedAppIds = state.selected_app_ids;
-  else selectedAppIds = await querySelectedAppIds({ bq, mode, limit, monthStr, country });
-
-  const selectedHash = sha256Hex(JSON.stringify({ month: monthStr, mode, country, limit, selectedAppIds }));
-  const resumeIndex = stateMatches ? Math.max(0, mustInt(state.last_index || 0, "state.last_index")) : 0;
+  const selectedAppIds = await querySelectedAppIds({ bq, mode, limit, monthStr, country });
 
   if (argv.dry_run) {
     process.stdout.write(
@@ -1328,7 +1278,7 @@ async function main() {
           country,
           limit,
           selected_count: selectedAppIds.length,
-          selected_hash: selectedHash,
+          processed_already_count: processedAlreadyCount,
           sample_app_ids: selectedAppIds.slice(0, 20),
         },
         null,
@@ -1337,19 +1287,6 @@ async function main() {
     );
     return;
   }
-
-  await writeJsonAtomic(statePath, {
-    month: monthStr,
-    mode,
-    country,
-    limit,
-    selected_hash: selectedHash,
-    selected_app_ids: selectedAppIds,
-    last_index: resumeIndex,
-    processed_count: stateMatches ? mustInt(state.processed_count || 0, "state.processed_count") : 0,
-    started_at: stateMatches ? state.started_at : nowIso(),
-    updated_at: nowIso(),
-  });
 
   await appendLine(
     runLogPath,
@@ -1362,8 +1299,7 @@ async function main() {
       country,
       limit,
       selected_count: selectedAppIds.length,
-      resume_index: resumeIndex,
-      selected_hash: selectedHash,
+      processed_already_count: processedAlreadyCount,
     })
   );
 
@@ -1371,7 +1307,7 @@ async function main() {
   const reloginRetriedAppIds = new Set();
   const t0 = Date.now();
 
-  appsLoop: for (let i = resumeIndex; i < selectedAppIds.length; i += 1) {
+  appsLoop: for (let i = 0; i < selectedAppIds.length; i += 1) {
     const appId = selectedAppIds[i];
     const idx1 = i + 1;
     const appStart = Date.now();
@@ -1721,15 +1657,6 @@ async function main() {
         await sleep(jitter(1500, 2500));
         continue appsLoop;
       }
-
-      const prevState = (await readJsonIfExists(statePath)) || {};
-      const processedCount = Number(prevState.processed_count || 0) + 1;
-      await writeJsonAtomic(statePath, {
-        ...prevState,
-        last_index: i + 1,
-        processed_count: processedCount,
-        updated_at: nowIso(),
-      });
 
       if (idx1 % 10 === 0) {
         const elapsedMs = Date.now() - t0;
