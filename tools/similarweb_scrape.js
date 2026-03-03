@@ -1,5 +1,6 @@
 ﻿import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import minimist from "minimist";
 import { chromium } from "playwright";
@@ -71,6 +72,12 @@ async function sniffAuthOrBlocked(page) {
     if (low.includes("sign in") || low.includes("log in") || low.includes("login")) return "login";
   } catch {}
   return "unknown";
+}
+
+function shardBucketForAppId(appId, workers) {
+  const hex = createHash("md5").update(String(appId)).digest("hex");
+  const first32 = parseInt(hex.slice(0, 8), 16) >>> 0;
+  return workers > 0 ? first32 % workers : 0;
 }
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1335,7 +1342,7 @@ async function main() {
   const argv = minimist(process.argv.slice(2), {
     boolean: ["dry_run", "headful", "debug_network"],
     string: ["month", "mode", "country"],
-    default: { limit: 150, mode: "backfill", country: String(COUNTRY_DEFAULT), dry_run: false, headful: false, debug_network: false },
+    default: { limit: 150, mode: "backfill", country: String(COUNTRY_DEFAULT), dry_run: false, headful: false, debug_network: false, workers: 1, worker: 0 },
   });
 
   const mode = String(argv.mode || "backfill");
@@ -1343,6 +1350,11 @@ async function main() {
 
   const limit = mustInt(argv.limit ?? 150, "--limit");
   const country = mustInt(argv.country ?? COUNTRY_DEFAULT, "--country");
+
+  const workers = mustInt(argv.workers ?? 1, "--workers");
+  const worker = mustInt(argv.worker ?? 0, "--worker");
+  if (workers < 1) throw new Error(`Invalid --workers: ${workers}`);
+  if (worker < 0 || worker >= workers) throw new Error(`Invalid --worker: ${worker} (must be 0..${workers - 1})`);
 
   const headful = Boolean(argv.headful);
   const debugNetwork = Boolean(argv.debug_network);
@@ -1359,6 +1371,8 @@ async function main() {
   const cookiesPath = path.join(__dirname, "cookies.json");
   const storageStatePath = path.join(__dirname, "storageState.json");
 
+  process.stdout.write(`Shard worker ${worker}/${workers}\n`);
+
   // Ensure Similarweb session is valid (auto relogin headful if expired).
   const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320?country=999&from=2026-01-01&to=2026-01-31&window=false";
   await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true });
@@ -1373,8 +1387,10 @@ async function main() {
   const bq = createBigQueryClient();
   await ensureSchemas(bq);
   const processedAlreadyCount = await queryProcessedAlreadyCount({ bq, monthStr, country });
+  const selectedAppIdsAll = await querySelectedAppIds({ bq, mode, limit, monthStr, country });
+  const shardSkippedCount = selectedAppIdsAll.reduce((acc, appId) => acc + (shardBucketForAppId(appId, workers) !== worker ? 1 : 0), 0);
+  const selectedAppIds = selectedAppIdsAll.filter((appId) => shardBucketForAppId(appId, workers) === worker);
 
-  const selectedAppIds = await querySelectedAppIds({ bq, mode, limit, monthStr, country });
 
   if (argv.dry_run) {
     process.stdout.write(
@@ -1384,6 +1400,10 @@ async function main() {
           mode,
           country,
           limit,
+          workers,
+          worker,
+          candidates_total: selectedAppIdsAll.length,
+          skipped_by_shard: shardSkippedCount,
           selected_count: selectedAppIds.length,
           processed_already_count: processedAlreadyCount,
           sample_app_ids: selectedAppIds.slice(0, 20),
@@ -1405,6 +1425,10 @@ async function main() {
       mode,
       country,
       limit,
+      workers,
+      worker,
+      candidates_total: selectedAppIdsAll.length,
+      skipped_by_shard: shardSkippedCount,
       selected_count: selectedAppIds.length,
       processed_already_count: processedAlreadyCount,
     })

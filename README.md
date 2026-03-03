@@ -42,6 +42,14 @@ node tools/similarweb_login.js
 
 ### Run (backfill)
 
+Parallel sharding (two scrapers, no overlap):
+
+```bash
+node tools/similarweb_scrape.js --mode=backfill --limit=5000 --country=999 --month=2026-01 --workers=2 --worker=0
+node tools/similarweb_scrape.js --mode=backfill --limit=5000 --country=999 --month=2026-01 --workers=2 --worker=1
+```
+
+
 Defaults:
 
 - `--mode=backfill`
