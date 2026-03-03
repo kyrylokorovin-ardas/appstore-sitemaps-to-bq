@@ -443,7 +443,8 @@ async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toD
     const m = String(href).match(/\/app-analysis\/overview\/google\/([^?"'\s]+)/i);
     return m ? m[1] : null;
   } finally {
-    await browser.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 }
 
@@ -1039,6 +1040,7 @@ async function scrapeOverviewWithNetwork({
   appId,
   googlePackage,
   storageStatePath,
+  userDataDir,
   headful,
   debugNetwork,
   alertsLogPath,
@@ -1050,7 +1052,9 @@ async function scrapeOverviewWithNetwork({
     window: "false",
   });
 
-    const browser = await chromium.launch({ headless: !headful });
+    let browser = null;
+    let context = null;
+    browser = userDataDir ? null : await chromium.launch({ headless: !headful });
   const jsonPayloads = [];
   const rscPayloads = [];
   const responsesMeta = [];
@@ -1058,7 +1062,7 @@ async function scrapeOverviewWithNetwork({
   const responseTasks = new Set();
 
   try {
-    const context = await browser.newContext({ storageState: storageStatePath });
+    context = userDataDir ? await chromium.launchPersistentContext(userDataDir, { headless: !headful }) : await browser.newContext({ storageState: storageStatePath });
     context.setDefaultTimeout(45_000);
     const page = await context.newPage();
     page.on("request", (req) => {
@@ -1335,7 +1339,8 @@ async function scrapeOverviewWithNetwork({
     );
     throw err;
   } finally {
-    await browser.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 }
 async function main() {
@@ -1359,6 +1364,8 @@ async function main() {
   const headful = Boolean(argv.headful);
   const debugNetwork = Boolean(argv.debug_network);
 
+  const profileDirArg = argv.profile_dir != null ? String(argv.profile_dir) : null;
+
   const monthDate = argv.month ? monthFromYyyyMm(argv.month) : previousFullMonthUtc();
   const monthStr = formatDateUTC(monthDate);
   const { from, to } = monthRangeUtc(monthDate);
@@ -1368,20 +1375,23 @@ async function main() {
   const yyyymmdd = todayYyyyMmDdUtc();
   const alertsLogPath = path.join(__dirname, "..", "logs", `similarweb_alerts_${yyyymmdd}.log`);
   const runLogPath = path.join(__dirname, "..", "logs", `similarweb_run_${yyyymmdd}.log`);
-  const cookiesPath = path.join(__dirname, "cookies.json");
-  const storageStatePath = path.join(__dirname, "storageState.json");
+  const baseSessionDir = profileDirArg ? path.resolve(__dirname, "..", profileDirArg) : __dirname;
+  if (profileDirArg) await fs.mkdir(baseSessionDir, { recursive: true });
+  const cookiesPath = path.join(baseSessionDir, "cookies.json");
+  const storageStatePath = path.join(baseSessionDir, "storageState.json");
+  const userDataDir = profileDirArg ? baseSessionDir : null;
 
   process.stdout.write(`Shard worker ${worker}/${workers}\n`);
 
   // Ensure Similarweb session is valid (auto relogin headful if expired).
   const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320?country=999&from=2026-01-01&to=2026-01-31&window=false";
-  await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true });
+  await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, userDataDir, storageStatePath, cookiesPath });
 
   try {
     await fs.access(cookiesPath);
     await fs.access(storageStatePath);
   } catch {
-    throw new Error("Missing Similarweb session files. Run `node tools/similarweb_login.js` first.");
+    throw new Error("Missing Similarweb session files. Run `node tools/similarweb_login.js` first (or pass --profile_dir to use a separate session)." );
   }
 
   const bq = createBigQueryClient();
@@ -1757,7 +1767,7 @@ async function main() {
           JSON.stringify({ event: "relogin", at: nowIso(), app_id: appId, reason: "SW_LOGIN_EXPIRED" })
         );
 
-        await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true });
+        await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, userDataDir, storageStatePath, cookiesPath });
         http = new SimilarwebHttpClient({ cookiesPath });
         retrySameApp = true;
       } else if (

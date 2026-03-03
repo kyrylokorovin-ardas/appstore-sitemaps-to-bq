@@ -12,13 +12,15 @@ function looksLikeLoginUrl(url) {
   return u.includes("/login") || u.includes("signin") || u.includes("sign-in") || u.includes("/auth");
 }
 
-export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, url = null } = {}) {
+export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, url = null, userDataDir = null, storageStatePath = null, cookiesPath = null } = {}) {
   const timeoutMs = Number(timeoutMinutes) * 60 * 1000;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error(`Invalid timeoutMinutes: ${timeoutMinutes}`);
 
-  const browser = await chromium.launch({ headless: !headful });
+  let browser = null;
+  let context = null;
   try {
-    const context = await browser.newContext();
+    browser = userDataDir ? null : await chromium.launch({ headless: !headful });
+    context = userDataDir ? await chromium.launchPersistentContext(String(userDataDir), { headless: !headful }) : await browser.newContext();
     const page = await context.newPage();
 
     process.stdout.write(
@@ -49,31 +51,43 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
       await page.waitForTimeout(1000);
     }
 
-    await context.storageState({ path: path.join(__dirname, "storageState.json") });
+    const outStorage = storageStatePath ? String(storageStatePath) : path.join(__dirname, "storageState.json");
+    const outCookies = cookiesPath ? String(cookiesPath) : path.join(__dirname, "cookies.json");
+
+    await context.storageState({ path: outStorage });
     const cookies = await context.cookies();
-    await fs.writeFile(path.join(__dirname, "cookies.json"), JSON.stringify(cookies, null, 2) + "\n", "utf8");
+    await fs.writeFile(outCookies, JSON.stringify(cookies, null, 2) + "\n", "utf8");
 
     process.stdout.write("Login OK. Cookies exported.\n");
   } finally {
-    await browser.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 }
 
 async function main() {
   const argv = minimist(process.argv.slice(2), {
     boolean: ["headless"],
-    string: ["url"],
+    string: ["url", "profile_dir"],
     default: { timeout_minutes: 20, headless: false },
   });
+
+  const profileDirArg = argv.profile_dir != null ? String(argv.profile_dir) : null;
+  const baseSessionDir = profileDirArg ? path.resolve(__dirname, "..", profileDirArg) : __dirname;
+  if (profileDirArg) await fs.mkdir(baseSessionDir, { recursive: true });
 
   await loginAndSaveState({
     headful: !Boolean(argv.headless),
     timeoutMinutes: Number(argv.timeout_minutes ?? 20),
     url: argv.url ? String(argv.url) : null,
+    userDataDir: profileDirArg ? baseSessionDir : null,
+    storageStatePath: path.join(baseSessionDir, "storageState.json"),
+    cookiesPath: path.join(baseSessionDir, "cookies.json"),
   });
 }
 
-if (fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+const argv1 = process.argv[1];
+if (argv1 && fileURLToPath(import.meta.url) === path.resolve(argv1)) {
   main().catch((err) => {
     process.stderr.write(`${err?.stack || err}\n`);
     process.exitCode = 1;

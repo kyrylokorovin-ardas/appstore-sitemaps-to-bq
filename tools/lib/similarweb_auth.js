@@ -22,10 +22,12 @@ async function fileExists(p) {
   }
 }
 
-async function checkSession({ storageStatePath, urlToCheck }) {
-  const browser = await chromium.launch({ headless: true });
+async function checkSession({ storageStatePath, userDataDir, urlToCheck }) {
+  let browser = null;
+  let context = null;
+  browser = userDataDir ? null : await chromium.launch({ headless: true });
   try {
-    const context = await browser.newContext({ storageState: storageStatePath });
+    context = userDataDir ? await chromium.launchPersistentContext(userDataDir, { headless: true }) : await browser.newContext({ storageState: storageStatePath });
     context.setDefaultTimeout(45_000);
 
     const page = await context.newPage();
@@ -56,31 +58,36 @@ async function checkSession({ storageStatePath, urlToCheck }) {
 
     return { ok: true, reason: "ok", status, finalUrl };
   } finally {
-    await browser.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 }
 
 export async function ensureSimilarwebAuth({
   urlToCheck,
   headfulOnRelogin = true,
+  userDataDir = null,
+  storageStatePath: storageStatePathOverride = null,
+  cookiesPath: cookiesPathOverride = null,
 } = {}) {
   if (!urlToCheck) throw new Error("ensureSimilarwebAuth: missing urlToCheck");
 
-  const storageStatePath = path.join(__dirname, "..", "storageState.json");
+  const storageStatePath = storageStatePathOverride || path.join(__dirname, "..", "storageState.json");
+  const cookiesPath = cookiesPathOverride || path.join(__dirname, "..", "cookies.json");
 
-  if (!(await fileExists(storageStatePath))) {
+  if (!userDataDir && !(await fileExists(storageStatePath))) {
     process.stdout.write("Similarweb auth: missing storageState.json; opening login...\n");
-    await loginAndSaveState({ headful: headfulOnRelogin });
+    await loginAndSaveState({ headful: headfulOnRelogin, userDataDir, storageStatePath, cookiesPath });
     return;
   }
 
-  const res = await checkSession({ storageStatePath, urlToCheck });
+  const res = await checkSession({ storageStatePath, userDataDir, urlToCheck });
   if (res.ok) return;
 
   process.stdout.write(`Similarweb auth: session invalid (${res.reason}); opening login...\n`);
-  await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck });
+  await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });
 
-  const res2 = await checkSession({ storageStatePath, urlToCheck });
+  const res2 = await checkSession({ storageStatePath, userDataDir, urlToCheck });
   if (!res2.ok) {
     throw new Error(`Similarweb auth still invalid after relogin: ${res2.reason}`);
   }
