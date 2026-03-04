@@ -79,6 +79,67 @@ function shardBucketForAppId(appId, workers) {
   const first32 = parseInt(hex.slice(0, 8), 16) >>> 0;
   return workers > 0 ? first32 % workers : 0;
 }
+
+let requestBlockingLogged = false;
+const REQUEST_BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
+const REQUEST_BLOCKED_URL_RE = /googletagmanager|google-analytics|doubleclick|segment|hotjar|mixpanel|sentry|datadog|amplitude/i;
+
+async function createReusablePlaywrightPage({ storageStatePath, userDataDir, headful }) {
+  let browser = null;
+  let context = null;
+  let page = null;
+
+  if (userDataDir) {
+    context = await chromium.launchPersistentContext(userDataDir, { headless: !headful });
+  } else {
+    browser = await chromium.launch({ headless: !headful });
+    context = await browser.newContext({ storageState: storageStatePath });
+  }
+
+  context.setDefaultTimeout(45_000);
+
+  await context.route("**/*", (route) => {
+    try {
+      const req = route.request();
+      const url = req.url();
+      const rt = req.resourceType();
+      if (REQUEST_BLOCKED_RESOURCE_TYPES.has(rt) || REQUEST_BLOCKED_URL_RE.test(url)) return route.abort();
+      return route.continue();
+    } catch {
+      return route.continue();
+    }
+  });
+
+  if (!requestBlockingLogged) {
+    requestBlockingLogged = true;
+    process.stdout.write("Request blocking enabled\n");
+  }
+
+  page = await context.newPage();
+
+  async function recreatePage() {
+    try {
+      if (page) await page.close().catch(() => {});
+    } finally {
+      page = await context.newPage();
+    }
+    return page;
+  }
+
+  async function close() {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+
+  return {
+    get page() {
+      return page;
+    },
+    recreatePage,
+    close,
+  };
+}
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -403,25 +464,20 @@ async function lookupGooglePackageFromMap(bq, appId) {
   return rows[0]?.google_package || null;
 }
 
-async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toDate, headful }) {
-  const storagePath = path.join(__dirname, "storageState.json");
-  const browser = await chromium.launch({ headless: !headful });
+async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toDate, headful, storageStatePath, userDataDir }) {
+  let browser = null;
+  let context = null;
 
   try {
-    const context = await browser.newContext({ storageState: storagePath });
+    if (userDataDir) {
+      context = await chromium.launchPersistentContext(userDataDir, { headless: !headful });
+    } else {
+      browser = await chromium.launch({ headless: !headful });
+      context = await browser.newContext({ storageState: storageStatePath });
+    }
+
     context.setDefaultTimeout(30_000);
     const page = await context.newPage();
-    page.on("request", (req) => {
-      try {
-        const url = req.url();
-        if (/datadoghq|browser-intake|mpps\.similarweb\.com\/track/i.test(url)) return;
-        if (requestsMeta.length < 400) {
-          requestsMeta.push({ url, method: req.method(), resource_type: req.resourceType() });
-        }
-      } catch {
-        // ignore
-      }
-    });
 
     const appleUrl = buildSimilarwebUrl(`/app-analysis/overview/apple/${appId}`, {
       country,
@@ -430,7 +486,7 @@ async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toD
       window: "false",
     });
 
-    await page.goto(appleUrl, { waitUntil: "domcontentloaded" });
+    await page.goto(appleUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForTimeout(1500);
 
     const href = await page.evaluate(() => {
@@ -440,14 +496,13 @@ async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toD
     });
 
     if (!href) return null;
-    const m = String(href).match(/\/app-analysis\/overview\/google\/([^?"'\s]+)/i);
-    return m ? m[1] : null;
+    const m2 = String(href).match(/\/app-analysis\/overview\/google\/([^?"'\s]+)/i);
+    return m2 ? m2[1] : null;
   } finally {
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
   }
 }
-
 async function queryProcessedAlreadyCount({ bq, monthStr, country }) {
   const countryInt = mustInt(country, "--country");
   const query = `
@@ -618,6 +673,7 @@ async function fetchAndInsert({
 
     return { skipped: false, pageUrl, text, parsed };
   } catch (err) {
+    if (isPlaywrightTimeout(err)) await pw.recreatePage().catch(() => {});
     await insertAlert(
       bq,
       {
@@ -682,6 +738,7 @@ async function scrapeTechnographicsSdks({
     await insertRows(table, newRows);
     return { inserted: newRows.length, pageUrl };
   } catch (err) {
+    if (isPlaywrightTimeout(err)) await pw.recreatePage().catch(() => {});
     await insertAlert(
       bq,
       {
@@ -1039,10 +1096,8 @@ async function scrapeOverviewWithNetwork({
   toStr,
   appId,
   googlePackage,
-  storageStatePath,
-  userDataDir,
-  headful,
-  debugNetwork,
+  pw,
+    debugNetwork,
   alertsLogPath,
 }) {
   const pageUrl = buildSimilarwebUrl(`/app-analysis/overview/${store}/${id}`, {
@@ -1051,10 +1106,8 @@ async function scrapeOverviewWithNetwork({
     to: toStr,
     window: "false",
   });
+  const page = pw.page;
 
-    let browser = null;
-    let context = null;
-    browser = userDataDir ? null : await chromium.launch({ headless: !headful });
   const jsonPayloads = [];
   const rscPayloads = [];
   const responsesMeta = [];
@@ -1062,10 +1115,8 @@ async function scrapeOverviewWithNetwork({
   const responseTasks = new Set();
 
   try {
-    context = userDataDir ? await chromium.launchPersistentContext(userDataDir, { headless: !headful }) : await browser.newContext({ storageState: storageStatePath });
-    context.setDefaultTimeout(45_000);
-    const page = await context.newPage();
-    page.on("request", (req) => {
+    const onRequest = (req) => {
+
       try {
         const url = req.url();
         if (/datadoghq|browser-intake|mpps\.similarweb\.com\/track/i.test(url)) return;
@@ -1075,9 +1126,11 @@ async function scrapeOverviewWithNetwork({
       } catch {
         // ignore
       }
-    });
+    };
+    page.on("request", onRequest);
 
-    page.on("response", (resp) => {
+    const onResponse = (resp) => {
+
       const task = (async () => {
         const url = resp.url();
         const status = resp.status();
@@ -1123,14 +1176,16 @@ async function scrapeOverviewWithNetwork({
       })();
       responseTasks.add(task);
       void task.finally(() => responseTasks.delete(task)).catch(() => {});
-    });
+    };
+    page.on("response", onResponse);
+
     const gotoBackoffs = [5000, 15000];
     let navigated = false;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
-        await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
+        await page.waitForSelector("text=Performance Overview", { timeout: 45_000 }).catch(() => {});
         await page.waitForSelector("text=Store Downloads", { timeout: 45_000 }).catch(() => {});
         await page.waitForTimeout(6000);
         await Promise.allSettled(Array.from(responseTasks));
@@ -1171,7 +1226,9 @@ async function scrapeOverviewWithNetwork({
           },
           alertsLogPath
         );
-        return { skipped: true, pageUrl, googlePackageHint: null };
+        await pw.recreatePage().catch(() => {});
+        await pw.recreatePage().catch(() => {});
+      return { skipped: true, pageUrl, googlePackageHint: null };
       }
     }
 
@@ -1190,6 +1247,7 @@ async function scrapeOverviewWithNetwork({
         },
         alertsLogPath
       );
+      await pw.recreatePage().catch(() => {});
       return { skipped: true, pageUrl, googlePackageHint: null };
     }
 
@@ -1323,6 +1381,7 @@ async function scrapeOverviewWithNetwork({
 
     return { skipped: false, pageUrl, googlePackageHint };
   } catch (err) {
+    if (isPlaywrightTimeout(err)) await pw.recreatePage().catch(() => {});
     await insertAlert(
       bq,
       {
@@ -1339,8 +1398,12 @@ async function scrapeOverviewWithNetwork({
     );
     throw err;
   } finally {
-    if (context) await context.close().catch(() => {});
-    if (browser) await browser.close().catch(() => {});
+    try {
+      page.off("request", onRequest);
+      page.off("response", onResponse);
+    } catch {
+      // ignore
+    }
   }
 }
 async function main() {
@@ -1390,6 +1453,8 @@ async function main() {
   try {
     await fs.access(cookiesPath);
     await fs.access(storageStatePath);
+  let pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
+
   } catch {
     throw new Error("Missing Similarweb session files. Run `node tools/similarweb_login.js` first (or pass --profile_dir to use a separate session)." );
   }
@@ -1574,7 +1639,7 @@ async function main() {
       if (!googlePackage && appleOverview?.googlePackageHint) googlePackage = appleOverview.googlePackageHint;
       if (!googlePackage) {
         try {
-          googlePackage = await resolveGooglePackageViaPlaywright({ appId, country, fromDate: from, toDate: to, headful });
+          googlePackage = await resolveGooglePackageViaPlaywright({ appId, country, fromDate: from, toDate: to, headful, storageStatePath, userDataDir });
         } catch (err) {
           await insertAlert(
             bq,
@@ -1768,6 +1833,8 @@ async function main() {
         );
 
         await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, userDataDir, storageStatePath, cookiesPath });
+        if (pw) await pw.close().catch(() => {});
+        pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
         http = new SimilarwebHttpClient({ cookiesPath });
         retrySameApp = true;
       } else if (
