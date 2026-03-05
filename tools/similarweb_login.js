@@ -41,6 +41,11 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
     const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320";
     let authed = false;
     while (Date.now() < loginDetectDeadline) {
+      const cur = page.url() || "";
+      if (looksLikeLoginUrl(cur)) {
+        await page.waitForTimeout(3000);
+        continue;
+      }
       try {
         const resp = await page.goto(authCheckUrl, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
@@ -61,7 +66,7 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
         // ignore and retry
       }
 
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(3000);
     }
 
     if (!authed) {
