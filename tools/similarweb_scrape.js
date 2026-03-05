@@ -525,6 +525,7 @@ async function upsertMapRow(bq, { appId, googlePackage, sourceUrl }) {
   await bq.query({
     query,
     params: { app_id: appId, google_package: googlePackage, source_url: sourceUrl || null },
+    types: { app_id: "INT64", google_package: "STRING", source_url: "STRING" },
   });
 }
 
@@ -536,7 +537,7 @@ async function lookupGooglePackageFromMap(bq, appId) {
     ORDER BY last_seen DESC
     LIMIT 1
   `;
-  const [rows] = await bq.query({ query, params: { app_id: appId } });
+  const [rows] = await bq.query({ query, params: { app_id: appId }, types: { app_id: "INT64" } });
   return rows[0]?.google_package || null;
 }
 
@@ -590,7 +591,7 @@ async function queryProcessedAlreadyCount({ bq, monthStr, country, tab }) {
       AND country = @country
       AND google_package IS NULL
   `;
-  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt } });
+  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt }, types: { month: "DATE", country: "INT64" } });
   return Number(rows?.[0]?.c ?? 0);
 }
 
@@ -680,7 +681,7 @@ async function querySelectionStats({ bq, monthStr, country, tab }) {
     FROM joined
   `;
 
-  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt } });
+  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt }, types: { month: "DATE", country: "INT64" } });
   const r = rows?.[0] || {};
   return {
     candidates_total: Number(r.candidates_total || 0),
@@ -749,7 +750,7 @@ async function querySelectedAppIds({ bq, mode, limit, monthStr, country, tab }) 
     LIMIT @limit
   `;
 
-  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt, limit: limitInt } });
+  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt, limit: limitInt }, types: { month: "DATE", country: "INT64", limit: "INT64" } });
   return rows.map((r) => Number(r.app_id)).filter((n) => Number.isFinite(n));
 }
 
@@ -769,7 +770,9 @@ async function rowExists(bq, tableId, { monthStr, country, appId, googlePackage 
     WHERE ${where.join(" AND ")}
     LIMIT 1
   `;
-  const [rows] = await bq.query({ query, params });
+  const types = { month: "DATE", country: "INT64", app_id: "INT64" };
+  if (googlePackage != null) types.google_package = "STRING";
+  const [rows] = await bq.query({ query, params, types });
   return rows.length > 0;
 }
 
@@ -798,7 +801,10 @@ async function deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, goo
     WHERE ${where.join(" AND ")}
   `;
 
-  await bq.query({ query, params });
+  const types = { month: "DATE", country: "INT64", app_id: "INT64" };
+  if (googlePackage != null) types.google_package = "STRING";
+
+  await bq.query({ query, params, types });
 }
 
 
@@ -816,7 +822,9 @@ async function existingSdkNames(bq, tableId, { monthStr, country, appId, googleP
     FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
     WHERE ${where.join(" AND ")}
   `;
-  const [rows] = await bq.query({ query, params });
+  const types = { month: "DATE", country: "INT64", app_id: "INT64" };
+  if (googlePackage != null) types.google_package = "STRING";
+  const [rows] = await bq.query({ query, params, types });
   return new Set(rows.map((r) => String(r.sdk_name)));
 }
 
@@ -1618,6 +1626,9 @@ async function main() {
   const { from, to } = monthRangeUtc(monthDate);
   const fromStr = formatDateUTC(from);
   const toStr = formatDateUTC(to);
+
+  process.stdout.write("BQ params: month=" + monthStr + " (DATE), country=" + country + " (INT64)\\n");
+
 
   const yyyymmdd = todayYyyyMmDdUtc();
   const alertsLogPath = path.join(__dirname, "..", "logs", `similarweb_alerts_${yyyymmdd}.log`);
