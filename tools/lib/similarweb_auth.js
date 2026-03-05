@@ -116,8 +116,8 @@ export async function ensureSimilarwebAuth({
   const res = await checkSession({ storageStatePath, userDataDir, urlToCheck, headful: checkHeadful });
   if (res.ok) return;
 
-  process.stdout.write(`Similarweb auth: session invalid (${res.reason}); opening login...\n`);
-  if (!reloginInFlight) {\n    reloginInFlight = (async () => {\n      await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });\n    })().finally(() => {\n      reloginInFlight = null;\n    });\n  }\n  await reloginInFlight;
+  process.stdout.write(`Similarweb auth: session invalid (${res.reason}); opening login...`);
+  if (!reloginInFlight) {    reloginInFlight = (async () => {      await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });    })().finally(() => {      reloginInFlight = null;    });  }  await reloginInFlight;
 
   const res2 = await checkSession({ storageStatePath, userDataDir, urlToCheck, headful: checkHeadful });
   if (!res2.ok) {
