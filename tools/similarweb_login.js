@@ -12,7 +12,7 @@ function looksLikeLoginUrl(url) {
   return u.includes("/login") || u.includes("signin") || u.includes("sign-in") || u.includes("/auth");
 }
 
-export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, url = null, userDataDir = null, storageStatePath = null, cookiesPath = null } = {}) {
+export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, url = null, userDataDir = null, storageStatePath = null, cookiesPath = null, verifyHttp = false } = {}) {
   const timeoutMs = Number(timeoutMinutes) * 60 * 1000;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error(`Invalid timeoutMinutes: ${timeoutMinutes}`);
 
@@ -122,14 +122,30 @@ if (!authed) {
       throw new Error("Login not detected");
     }
 
-    const outStorage = storageStatePath ? String(storageStatePath) : path.join(__dirname, "storageState.json");
+        // Visit secure.similarweb.com once so its cookies are captured too (if used by the session).
+    try {
+      await page.goto("https://secure.similarweb.com/", { waitUntil: "domcontentloaded" });
+      await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
+      await page.waitForTimeout(500);
+    } catch {
+      // ignore
+    }
+const outStorage = storageStatePath ? String(storageStatePath) : path.join(__dirname, "storageState.json");
     const outCookies = cookiesPath ? String(cookiesPath) : path.join(__dirname, "cookies.json");
 
     await context.storageState({ path: outStorage });
     const cookies = await context.cookies();
     await fs.writeFile(outCookies, JSON.stringify(cookies, null, 2) + "\n", "utf8");
 
-    process.stdout.write("Login OK. Cookies exported.\n");
+    process.stdout.write(`Login OK. Cookies exported.\n- storageState: ${outStorage}\n- cookies: ${outCookies}\n- cookies_count: ${cookies.length}\n`);
+
+    if (verifyHttp) {
+      const { SimilarwebHttpClient } = await import("./lib/httpClient.js");
+      const http = new SimilarwebHttpClient({ cookiesPath: outCookies });
+      const verifyUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320?country=999&from=2026-01-01&to=2026-01-31&window=false";
+      await http.fetchRscText(verifyUrl, { maxAttempts: 1 });
+      process.stdout.write("HTTP OK\n");
+    }
   } finally {
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
@@ -138,7 +154,7 @@ if (!authed) {
 
 async function main() {
   const argv = minimist(process.argv.slice(2), {
-    boolean: ["headless"],
+    boolean: ["headless", "verify_http"],
     string: ["url", "profile_dir"],
     default: { timeout_minutes: 20, headless: false },
   });
@@ -154,6 +170,7 @@ async function main() {
     userDataDir: profileDirArg ? baseSessionDir : null,
     storageStatePath: path.join(baseSessionDir, "storageState.json"),
     cookiesPath: path.join(baseSessionDir, "cookies.json"),
+    verifyHttp: Boolean(argv.verify_http),
   });
 }
 

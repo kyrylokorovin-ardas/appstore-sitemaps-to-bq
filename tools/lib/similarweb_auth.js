@@ -95,7 +95,7 @@ export async function ensureSimilarwebAuth({
 
   if (!userDataDir && !(await fileExists(storageStatePath))) {
     process.stdout.write("Similarweb auth: missing storageState.json; opening login...\n");
-    await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });
+    if (!reloginInFlight) {\n      reloginInFlight = (async () => {\n        if (!reloginInFlight) {\n    reloginInFlight = (async () => {\n      await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });\n    })().finally(() => {\n      reloginInFlight = null;\n    });\n  }\n  await reloginInFlight;\n      })().finally(() => {\n        reloginInFlight = null;\n      });\n    }\n    await reloginInFlight;
     const res0 = await checkSession({ storageStatePath, userDataDir, urlToCheck, headful: checkHeadful });
     if (!res0.ok) throw new Error("Similarweb auth still invalid after login: " + res0.reason);
     return;
@@ -105,7 +105,7 @@ export async function ensureSimilarwebAuth({
   if (res.ok) return;
 
   process.stdout.write(`Similarweb auth: session invalid (${res.reason}); opening login...\n`);
-  await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });
+  if (!reloginInFlight) {\n    reloginInFlight = (async () => {\n      await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });\n    })().finally(() => {\n      reloginInFlight = null;\n    });\n  }\n  await reloginInFlight;
 
   const res2 = await checkSession({ storageStatePath, userDataDir, urlToCheck, headful: checkHeadful });
   if (!res2.ok) {

@@ -1727,7 +1727,7 @@ async function main() {
     })
   );
 
-  let http = new SimilarwebHttpClient({ cookiesPath });
+  let http = new SimilarwebHttpClient({ cookiesPath, runLogPath });
   const reloginRetriedAppIds = new Set();
   const t0 = Date.now();
 
@@ -2198,7 +2198,7 @@ async function main() {
         await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, checkHeadful: headful, userDataDir, storageStatePath, cookiesPath });
         if (pw) await pw.close().catch(() => {});
         pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
-        http = new SimilarwebHttpClient({ cookiesPath });
+        http = new SimilarwebHttpClient({ cookiesPath, runLogPath });
         retrySameApp = true;
       } else if (
         err?.code === "SW_BLOCKED" ||
