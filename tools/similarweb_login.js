@@ -38,17 +38,33 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
     await page.goto(startUrl, { waitUntil: "domcontentloaded" });
 
     const deadline = Date.now() + timeoutMs;
+    let authed = false;
     while (Date.now() < deadline) {
       const cur = page.url() || "";
       const looksLikeSimilarweb = cur.startsWith("https://apps.similarweb.com/");
       const looksLikeLogin = looksLikeLoginUrl(cur);
 
-      if (looksLikeSimilarweb && !looksLikeLogin) {
+      const perfVisible = await page
+        .locator("text=Performance Overview")
+        .first()
+        .isVisible({ timeout: 1500 })
+        .catch(() => false);
+
+      if (looksLikeSimilarweb && !looksLikeLogin && perfVisible) {
         const cookies = await context.cookies();
-        if (cookies.length > 0) break;
+        if (cookies.length > 0) {
+          authed = true;
+          break;
+        }
       }
 
       await page.waitForTimeout(1000);
+    }
+
+    if (!authed) {
+      throw new Error(
+        "Timed out waiting for Similarweb login. Finish login and ensure the page shows \"Performance Overview\" (try opening an /app-analysis/overview/... URL)."
+      );
     }
 
     const outStorage = storageStatePath ? String(storageStatePath) : path.join(__dirname, "storageState.json");

@@ -1657,7 +1657,7 @@ async function main() {
 
   // Ensure Similarweb session is valid (auto relogin headful if expired).
   const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320?country=999&from=2026-01-01&to=2026-01-31&window=false";
-  await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, userDataDir, storageStatePath, cookiesPath });
+  await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, checkHeadful: headful, userDataDir, storageStatePath, cookiesPath });
 
   let pw = null;
   try {
@@ -2195,7 +2195,7 @@ async function main() {
           JSON.stringify({ event: "relogin", at: nowIso(), app_id: appId, reason: "SW_LOGIN_EXPIRED" })
         );
 
-        await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, userDataDir, storageStatePath, cookiesPath });
+        await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, checkHeadful: headful, userDataDir, storageStatePath, cookiesPath });
         if (pw) await pw.close().catch(() => {});
         pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
         http = new SimilarwebHttpClient({ cookiesPath });
