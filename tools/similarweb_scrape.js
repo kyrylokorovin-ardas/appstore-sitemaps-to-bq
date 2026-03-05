@@ -2232,8 +2232,26 @@ async function main() {
       if (idx1 % 10 === 0) {
         const elapsedMs = Date.now() - t0;
         const hours = elapsedMs / (1000 * 60 * 60);
-        const rate = hours > 0 ? (idx1 / hours).toFixed(2) : "inf";
-        process.stdout.write(`Progress ${idx1}/${selectedAppIds.length} | ${rate} apps/hour`);
+        const attemptedApps = counters.attempted_apps ?? idx1;
+        const rate = hours > 0 ? (attemptedApps / hours).toFixed(2) : 'inf';
+        const avgSecPerApp = attemptedApps > 0 ? (elapsedMs / 1000 / attemptedApps).toFixed(1) : 'inf';
+        console.log(
+          'Progress ' +
+            idx1 +
+            '/' +
+            selectedAppIds.length +
+            ' | attempted=' +
+            attemptedApps +
+            ' success=' +
+            counters.success +
+            ' errors=' +
+            counters.errors +
+            ' | ' +
+            rate +
+            ' apps/hour | avg ' +
+            avgSecPerApp +
+            's/app'
+        );
       }
 
       await appendLine(
@@ -2254,7 +2272,18 @@ async function main() {
     JSON.stringify({ event: 'summary', at: nowIso(), run_id: runId, tab, month: monthStr, country, worker, workers, counters })
   );
 
-  process.stdout.write(String.fromCharCode(10) + 'Summary: ' + JSON.stringify(counters) + String.fromCharCode(10));
+  {
+    const elapsedMs = Date.now() - t0;
+    const hours = elapsedMs / (1000 * 60 * 60);
+    const attemptedApps = counters.attempted_apps ?? 0;
+    const rate = hours > 0 ? (attemptedApps / hours).toFixed(2) : 'inf';
+    process.stdout.write(
+      String.fromCharCode(10) +
+        'Summary: ' +
+        JSON.stringify({ ...counters, elapsed_ms: elapsedMs, apps_per_hour: Number(rate) }) +
+        String.fromCharCode(10)
+    );
+  }
 
   await appendLine(runLogPath, JSON.stringify({ event: 'done', at: nowIso(), run_id: runId }));
 

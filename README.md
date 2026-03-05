@@ -61,6 +61,10 @@ node tools/similarweb_scrape.js --mode=backfill --tab=overview --limit=5000 --co
 node tools/similarweb_scrape.js --mode=backfill --tab=overview --limit=5000 --country=999 --month=2026-01 --workers=2 --worker=1 --profile_dir=profiles/acc1
 `
 
+Note: --limit is applied before sharding. With --workers=2, each worker will process roughly limit/2 apps (deterministically by md5(app_id) % workers).
+- Total ~10,000 apps across 2 workers: use --limit=10000.
+- ~10,000 apps per worker (2 workers): use --limit=20000.
+
 Defaults:
 
 - --mode=backfill
