@@ -8,6 +8,19 @@ import { loginAndSaveState } from "../similarweb_login.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+let reloginInFlight = null;
+
+async function reloginOnce(loginArgs) {
+  if (!reloginInFlight) {
+    reloginInFlight = (async () => {
+      await loginAndSaveState(loginArgs);
+    })().finally(() => {
+      reloginInFlight = null;
+    });
+  }
+  await reloginInFlight;
+}
+
 function looksLikeLoginUrl(url) {
   const u = String(url || "").toLowerCase();
   return u.includes("/login") || u.includes("signin") || u.includes("sign-in") || u.includes("/auth");
@@ -92,10 +105,9 @@ export async function ensureSimilarwebAuth({
 
   const storageStatePath = storageStatePathOverride || path.join(__dirname, "..", "storageState.json");
   const cookiesPath = cookiesPathOverride || path.join(__dirname, "..", "cookies.json");
-
   if (!userDataDir && !(await fileExists(storageStatePath))) {
-    process.stdout.write("Similarweb auth: missing storageState.json; opening login...\n");
-    if (!reloginInFlight) {\n      reloginInFlight = (async () => {\n        if (!reloginInFlight) {\n    reloginInFlight = (async () => {\n      await loginAndSaveState({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });\n    })().finally(() => {\n      reloginInFlight = null;\n    });\n  }\n  await reloginInFlight;\n      })().finally(() => {\n        reloginInFlight = null;\n      });\n    }\n    await reloginInFlight;
+    process.stdout.write("Similarweb auth: missing storageState.json; opening login...");
+    await reloginOnce({ headful: headfulOnRelogin, url: urlToCheck, userDataDir, storageStatePath, cookiesPath });
     const res0 = await checkSession({ storageStatePath, userDataDir, urlToCheck, headful: checkHeadful });
     if (!res0.ok) throw new Error("Similarweb auth still invalid after login: " + res0.reason);
     return;
