@@ -57,48 +57,25 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
         continue;
       }
 
-      // Non-invasive checks (no navigation) to avoid disrupting form input.
       try {
-        const urlOk = cur.includes("/app-analysis/");
-        const cookieStr = await page.evaluate(() => document.cookie || "").catch(() => "");
-        const cookieOk = String(cookieStr).toLowerCase().includes("auth");
-        if (urlOk || cookieOk) {
-          authed = true;
-          break;
-        }
-      } catch {
-        // ignore
-      }
+        const resp = await page.goto(authCheckUrl, { waitUntil: "domcontentloaded" });
+        await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
+        await page.waitForTimeout(1000);
 
-      try {
-        const cookies = await context.cookies();
-        const cookieOk = cookies.some((c) => String(c?.name || "").toLowerCase().includes("auth"));
-        if (cookieOk) {
+        const finalUrl = page.url() || "";
+        const status = resp ? resp.status() : null;
+        const urlOk = finalUrl.includes("/app-analysis/");
+        const looksLikeLogin = looksLikeLoginUrl(finalUrl);
+
+        if ((status == null || status < 400) && urlOk && !looksLikeLogin) {
           authed = true;
           break;
         }
       } catch {
-        // ignore
+        // ignore and retry
       }
 
       await page.waitForTimeout(3000);
-    }
-
-    if (authed) {
-      // Confirm by loading a stable app-analysis page once.
-      const resp = await page.goto(authCheckUrl, { waitUntil: "domcontentloaded" });
-      await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
-      await page.waitForTimeout(1000);
-
-      const finalUrl = page.url() || "";
-      const status = resp ? resp.status() : null;
-      const cookieStr = await page.evaluate(() => document.cookie || "").catch(() => "");
-
-      const urlOk = finalUrl.includes("/app-analysis/");
-      const cookieOk = String(cookieStr).toLowerCase().includes("auth");
-      if (!((status == null || status < 400) && (urlOk || cookieOk))) {
-        authed = false;
-      }
     }
 
 if (!authed) {
