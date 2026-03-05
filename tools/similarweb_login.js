@@ -118,7 +118,7 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
     }
 
 if (!authed) {
-      process.stdout.write("LOGIN NOT DETECTED – open any app-analysis page\n");
+      process.stdout.write("LOGIN NOT DETECTED - open any app-analysis page\n");
       throw new Error("Login not detected");
     }
 
