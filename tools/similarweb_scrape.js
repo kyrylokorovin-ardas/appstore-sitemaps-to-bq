@@ -158,6 +158,18 @@ async function fetchDomTextForTab(page, pageUrl, tabName) {
   const text = await page.evaluate(() => (document && document.body ? document.body.innerText : ""));
   return String(text || "");
 }
+async function writeDomNoDataDebug({ appId, store, tabName, pageUrl, text }) {
+  try {
+    const yyyymmdd = todayYyyyMmDdUtc();
+    const file = path.join(__dirname, "..", "logs", `dom_no_data_${yyyymmdd}_${store}_${tabName}_${appId}.txt`);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    const payload = `page_url=${pageUrl}\nstore=${store}\ntab=${tabName}\napp_id=${appId}\n\n` + String(text || "").slice(0, 20000);
+    await fs.writeFile(file, payload, "utf8");
+    return file;
+  } catch {
+    return null;
+  }
+}
 
 
 let requestBlockingLogged = false;
@@ -970,6 +982,10 @@ async function fetchAndInsert({
     if (!tabParsedHasData(effectiveTab, parsed)) {
       const e = new Error("No parsable data for tab");
       e.code = "SW_NO_DATA";
+      if (pwPage) {
+        const dbg = await writeDomNoDataDebug({ appId, store, tabName: effectiveTab, pageUrl, text });
+        if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_no_data", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: pageUrl, debug_file: dbg }));
+      }
       throw e;
     }
 
@@ -2428,7 +2444,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
 
 
 
