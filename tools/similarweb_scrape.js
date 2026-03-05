@@ -1,4 +1,4 @@
-﻿import fs from "node:fs/promises";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -94,6 +94,69 @@ async function exportCookiesFromStorageState(storageStatePath, cookiesPath) {
   } catch {
     return false;
   }
+}
+function hasAnyNonNullValue(obj) {
+  if (!obj) return false;
+  for (const v of Object.values(obj)) {
+    if (v == null) continue;
+    if (typeof v === "number" && Number.isNaN(v)) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    return true;
+  }
+  return false;
+}
+
+function tabParsedHasData(tabName, parsed) {
+  const p = parsed || {};
+  if (tabName === "reviews") return p.reply_rate_pct != null;
+  if (tabName === "usage_sessions") return p.mau != null || p.wau != null || p.dau != null;
+  if (tabName === "technographics") return p.sdks_total != null;
+  if (tabName === "revenue") return p.total_revenue_usd != null;
+  if (tabName === "audience") {
+    return (
+      p.gender_male_pct != null ||
+      p.gender_female_pct != null ||
+      p.age_18_24_pct != null ||
+      p.age_25_34_pct != null ||
+      p.age_35_44_pct != null ||
+      p.age_45_54_pct != null ||
+      p.age_55_plus_pct != null
+    );
+  }
+  return hasAnyNonNullValue(p);
+}
+
+function domWaitPatternsForTab(tabName) {
+  if (tabName === "reviews") return [/Reply rate/i, /Reply Rate/i];
+  if (tabName === "usage_sessions") return [/MAU/i, /Daily Stickiness/i, /Active Users/i];
+  if (tabName === "technographics") return [/SDKs/i, /Total SDKs/i];
+  if (tabName === "revenue") return [/Total Revenue/i, /Revenue/i];
+  if (tabName === "audience") return [/Gender/i, /Age/i, /Distribution/i];
+  return [];
+}
+
+async function fetchDomTextForTab(page, pageUrl, tabName) {
+  await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1200).catch(() => {});
+
+  const hint = await sniffAuthOrBlocked(page);
+  if (hint === "login") {
+    const e = new Error("Similarweb session appears expired.");
+    e.code = "SW_LOGIN_EXPIRED";
+    throw e;
+  }
+  if (hint === "blocked") {
+    const e = new Error("Similarweb access blocked (captcha / access denied).");
+    e.code = "SW_BLOCKED";
+    throw e;
+  }
+
+  for (const re of domWaitPatternsForTab(tabName)) {
+    await page.getByText(re).first().waitFor({ timeout: 20000 }).catch(() => {});
+  }
+  await page.waitForTimeout(700).catch(() => {});
+  const text = await page.evaluate(() => (document && document.body ? document.body.innerText : ""));
+  return String(text || "");
 }
 
 
@@ -199,6 +262,7 @@ function isBigQueryInsertError(err) {
 
 function classifyAuditStatus(err) {
   const code = err && err.code ? String(err.code) : '';
+  if (code === 'SW_NO_DATA') return 'NO_DATA';
   if (code === 'SW_LOGIN_EXPIRED') return 'LOGIN_EXPIRED';
   if (code === 'SW_BLOCKED') return 'CAPTCHA';
   if (code === 'SW_TOO_MANY_429' || code === 'SW_TOO_MANY_403') return 'HTTP_ERROR';
@@ -857,14 +921,56 @@ async function fetchAndInsert({
   googlePackage,
   parser,
   alertsLogPath,
+  pwPage = null,
+  domTabName = null,
 }) {
   const pageUrl = buildSimilarwebUrl(route, query);
+  const effectiveTab = domTabName || tab;
+
+  let text = null;
+  let parsed = {};
+  let usedDomFallback = false;
 
   try {
-    const { text } = await http.fetchRscText(pageUrl);
-    const rawRsc = truncateForBigQueryString(text);
+    try {
+      const r = await http.fetchRscText(pageUrl);
+      text = r && r.text != null ? String(r.text) : null;
+    } catch (err) {
+      // Fallback to DOM if HTTP/RSC fails (Similarweb sometimes returns 500 for RSC routes).
+      if (pwPage) {
+        text = await fetchDomTextForTab(pwPage, pageUrl, effectiveTab);
+        usedDomFallback = true;
+      } else {
+        throw err;
+      }
+    }
 
-    const parsed = parser ? parser(text) : {};
+    if (text == null) {
+      const e = new Error("No response text");
+      e.code = "SW_NO_DATA";
+      throw e;
+    }
+
+    parsed = parser ? parser(text) : {};
+
+    // If RSC text is only a shell/loading stream, try DOM.
+    if (!tabParsedHasData(effectiveTab, parsed) && pwPage && !usedDomFallback) {
+      const domText = await fetchDomTextForTab(pwPage, pageUrl, effectiveTab);
+      const domParsed = parser ? parser(domText) : {};
+      if (tabParsedHasData(effectiveTab, domParsed)) {
+        text = domText;
+        parsed = domParsed;
+        usedDomFallback = true;
+      }
+    }
+
+    if (!tabParsedHasData(effectiveTab, parsed)) {
+      const e = new Error("No parsable data for tab");
+      e.code = "SW_NO_DATA";
+      throw e;
+    }
+
+    const rawRsc = truncateForBigQueryString(text);
     const row = {
       month: monthStr,
       country,
@@ -880,27 +986,27 @@ async function fetchAndInsert({
     await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
     await insertRows(table, [row]);
 
-    return { skipped: false, pageUrl, text, parsed };
+    return { skipped: false, pageUrl, text, parsed, usedDomFallback };
   } catch (err) {
-
-    await insertAlert(
-      bq,
-      {
-        store,
-        tab,
-        stage: "fetch_or_insert",
-        app_id: appId,
-        google_package: googlePackage || null,
-        page_url: pageUrl,
-        error_type: err?.code || "error",
-        error_message: formatErrorMessage(err),
-      },
-      alertsLogPath
-    );
+    if (err?.code !== "SW_NO_DATA") {
+      await insertAlert(
+        bq,
+        {
+          store,
+          tab,
+          stage: "fetch_or_insert",
+          app_id: appId,
+          google_package: googlePackage || null,
+          page_url: pageUrl,
+          error_type: err?.code || "error",
+          error_message: formatErrorMessage(err),
+        },
+        alertsLogPath
+      );
+    }
     throw err;
   }
 }
-
 async function scrapeTechnographicsSdks({
   http,
   bq,
@@ -1899,6 +2005,8 @@ async function main() {
         googlePackage,
         parser,
         alertsLogPath,
+        pwPage: pw?.page,
+        domTabName: tabName,
       });
 
       await recordAudit({ store, tabName, appId, googlePackage, status: "SUCCESS", details: null, pageUrl, durationMs: Date.now() - started, attemptNum });
@@ -1941,6 +2049,8 @@ async function main() {
         googlePackage,
         parser: (t) => parseTechnographicsOverview(t),
         alertsLogPath,
+        pwPage: pw?.page,
+        domTabName: "technographics",
       });
 
       await scrapeTechnographicsSdks({
@@ -2312,8 +2422,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
-
 
 
 
