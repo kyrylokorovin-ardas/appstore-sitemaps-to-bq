@@ -486,8 +486,10 @@ async function ensureSchemas(bq) {
   await ensureTable(bq, DATASET_ID, TABLES.audit, {
     schema: appAuditSchema,
     timePartitioning: { type: "DAY", field: "pulled_at" },
-    clustering: { fields: ["run_id", "store", "tab", "status", "app_id"] },
-  });  await ensureTable(bq, DATASET_ID, TABLES.alerts, {
+    clustering: { fields: ["run_id", "store", "tab", "app_id"] },
+  });
+
+  await ensureTable(bq, DATASET_ID, TABLES.alerts, {
     schema: alertSchema,
     timePartitioning: { type: "DAY", field: "pulled_at" },
     clustering: { fields: ["store", "tab", "error_type"] },
