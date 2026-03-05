@@ -644,17 +644,17 @@ async function querySelectionStats({ bq, monthStr, country, tab }) {
 
   const query = `
     WITH base AS (
-      SELECT DISTINCT app_id
+      SELECT DISTINCT SAFE_CAST(app_id AS INT64) AS app_id
       FROM \`${PROJECT_ID}.${DATASET_ID}.app_urls_raw\`
-      WHERE app_id IS NOT NULL
+      WHERE SAFE_CAST(app_id AS INT64) IS NOT NULL
     ),
     meta AS (
       SELECT
-        app_id,
+        SAFE_CAST(app_id AS INT64) AS app_id,
         MAX(IF(LOWER(CAST(country AS STRING)) = 'us', 1, 0)) AS has_us,
         MAX(SAFE_CAST(user_rating_count AS INT64)) AS user_rating_count_max
       FROM \`${PROJECT_ID}.${DATASET_ID}.app_metadata_by_country\`
-      WHERE app_id IS NOT NULL
+      WHERE SAFE_CAST(app_id AS INT64) IS NOT NULL
       GROUP BY app_id
     ),
     candidates AS (
@@ -714,17 +714,17 @@ async function querySelectedAppIds({ bq, mode, limit, monthStr, country, tab }) 
 
   const query = `
     WITH base AS (
-      SELECT DISTINCT app_id
+      SELECT DISTINCT SAFE_CAST(app_id AS INT64) AS app_id
       FROM \`${PROJECT_ID}.${DATASET_ID}.app_urls_raw\`
-      WHERE app_id IS NOT NULL
+      WHERE SAFE_CAST(app_id AS INT64) IS NOT NULL
     ),
     meta AS (
       SELECT
-        app_id,
+        SAFE_CAST(app_id AS INT64) AS app_id,
         MAX(IF(LOWER(CAST(country AS STRING)) = 'us', 1, 0)) AS has_us,
         MAX(SAFE_CAST(user_rating_count AS INT64)) AS user_rating_count_max
       FROM \`${PROJECT_ID}.${DATASET_ID}.app_metadata_by_country\`
-      WHERE app_id IS NOT NULL
+      WHERE SAFE_CAST(app_id AS INT64) IS NOT NULL
       GROUP BY app_id
     ),
     candidates AS (
