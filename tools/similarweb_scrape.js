@@ -1,4 +1,4 @@
-﻿import fs from "node:fs/promises";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -35,6 +35,7 @@ const COUNTRY_DEFAULT = 999;
 const TABLES = {
   map: "similarweb_app_map",
   alerts: "similarweb_alerts",
+  audit: "similarweb_app_audit",
   apple: {
     overview: "similarweb_appstore_overview",
     reviews: "similarweb_appstore_reviews",
@@ -43,6 +44,7 @@ const TABLES = {
     technographics_sdks: "similarweb_appstore_technographics_sdks",
     revenue: "similarweb_appstore_revenue",
     audience: "similarweb_appstore_audience",
+    audit: "similarweb_appstore_audit",
   },
   google: {
     overview: "similarweb_googleplay_overview",
@@ -171,6 +173,38 @@ function formatErrorMessage(err) {
   const snippet = err && err.bodySnippet ? " snippet=" + String(err.bodySnippet).replace(/\s+/g, " ").slice(0, 500) : "";
   return (msg + status + loc + snippet).trim();
 }
+
+function isBigQueryInsertError(err) {
+  if (!err) return false;
+  if (String(err.name || "") === "PartialFailureError") return true;
+  if (Array.isArray(err.errors) && err.errors.length) return true;
+  const msg = String(err.message || err);
+  return /bigquery/i.test(msg) || /insert/i.test(msg);
+}
+
+function classifyAuditStatus(err) {
+  const code = err && err.code ? String(err.code) : '';
+  if (code === 'SW_LOGIN_EXPIRED') return 'LOGIN_EXPIRED';
+  if (code === 'SW_BLOCKED') return 'CAPTCHA';
+  if (code === 'SW_TOO_MANY_429' || code === 'SW_TOO_MANY_403') return 'HTTP_ERROR';
+  if (isPlaywrightTimeout(err)) return 'NAV_TIMEOUT';
+  if (isBigQueryInsertError(err)) return 'BQ_ERROR';
+  if (err && (err.httpStatus || err.status)) return 'HTTP_ERROR';
+  return 'PARSE_ERROR';
+}
+
+function generateRunId({ worker, workers }) {
+  const base = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const rand = Math.random().toString(16).slice(2, 10);
+  return `${base}_w${worker}of${workers}_${rand}`;
+}
+
+function truncateDetails(s, maxChars = 800) {
+  if (s == null) return null;
+  const str = String(s);
+  return str.length <= maxChars ? str : str.slice(0, maxChars);
+}
+
 function todayYyyyMmDdUtc() {
   const d = new Date();
   const y = d.getUTCFullYear();
@@ -328,6 +362,35 @@ async function ensureSchemas(bq) {
     { name: "source_url", type: "STRING", mode: "NULLABLE" },
   ];
 
+  const auditSchema = [
+    { name: "run_id", type: "STRING", mode: "REQUIRED" },
+    { name: "app_id", type: "STRING", mode: "REQUIRED" },
+    { name: "country", type: "INT64", mode: "REQUIRED" },
+    { name: "month", type: "DATE", mode: "REQUIRED" },
+    { name: "status", type: "STRING", mode: "REQUIRED" },
+    { name: "details", type: "STRING", mode: "NULLABLE" },
+    { name: "started_at", type: "TIMESTAMP", mode: "REQUIRED" },
+    { name: "finished_at", type: "TIMESTAMP", mode: "REQUIRED" },
+    { name: "duration_ms", type: "INT64", mode: "NULLABLE" },
+    { name: "worker", type: "INT64", mode: "REQUIRED" },
+    { name: "workers", type: "INT64", mode: "REQUIRED" },
+    { name: "attempt_num", type: "INT64", mode: "REQUIRED" },
+  ];
+  const appAuditSchema = [
+    { name: "run_id", type: "STRING", mode: "REQUIRED" },
+    { name: "pulled_at", type: "TIMESTAMP", mode: "REQUIRED" },
+    { name: "store", type: "STRING", mode: "REQUIRED" },
+    { name: "tab", type: "STRING", mode: "REQUIRED" },
+    { name: "month", type: "DATE", mode: "REQUIRED" },
+    { name: "country", type: "INT64", mode: "REQUIRED" },
+    { name: "app_id", type: "INT64", mode: "REQUIRED" },
+    { name: "google_package", type: "STRING", mode: "NULLABLE" },
+    { name: "status", type: "STRING", mode: "REQUIRED" },
+    { name: "details", type: "STRING", mode: "NULLABLE" },
+    { name: "page_url", type: "STRING", mode: "NULLABLE" },
+    { name: "duration_ms", type: "INT64", mode: "NULLABLE" },
+    { name: "attempt_num", type: "INT64", mode: "REQUIRED" },
+  ];
   const appleClustering = { fields: ["app_id"] };
   const googleClustering = { fields: ["app_id", "google_package"] };
 
@@ -413,7 +476,18 @@ async function ensureSchemas(bq) {
     clustering: { fields: ["app_id"] },
   });
 
-  await ensureTable(bq, DATASET_ID, TABLES.alerts, {
+
+  await ensureTable(bq, DATASET_ID, TABLES.apple.audit, {
+    schema: auditSchema,
+    timePartitioning: monthPartitioning,
+    clustering: { fields: ["run_id", "status", "app_id"] },
+  });
+
+  await ensureTable(bq, DATASET_ID, TABLES.audit, {
+    schema: appAuditSchema,
+    timePartitioning: { type: "DAY", field: "pulled_at" },
+    clustering: { fields: ["run_id", "store", "tab", "status", "app_id"] },
+  });  await ensureTable(bq, DATASET_ID, TABLES.alerts, {
     schema: alertSchema,
     timePartitioning: { type: "DAY", field: "pulled_at" },
     clustering: { fields: ["store", "tab", "error_type"] },
@@ -503,67 +577,177 @@ async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toD
     if (browser) await browser.close().catch(() => {});
   }
 }
-async function queryProcessedAlreadyCount({ bq, monthStr, country }) {
+async function queryProcessedAlreadyCount({ bq, monthStr, country, tab }) {
   const countryInt = mustInt(country, "--country");
+  const tables = appleDestTablesForTab(String(tab || "overview"));
+  const tableId = tables[0] || TABLES.apple.overview;
   const query = `
     SELECT COUNT(DISTINCT app_id) AS c
-    FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLES.apple.overview}\`
-    WHERE month = @month AND country = @country
+    FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
+    WHERE month = @month
+      AND country = @country
+      AND google_package IS NULL
   `;
   const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt } });
   return Number(rows?.[0]?.c ?? 0);
 }
-async function querySelectedAppIds({ bq, mode, limit, monthStr, country }) {
-  void mode;
-  const limitInt = mustInt(limit, "--limit");
+
+function appleDestTablesForTab(tab) {
+  switch (tab) {
+    case "overview":
+      return [TABLES.apple.overview];
+    case "reviews":
+      return [TABLES.apple.reviews];
+    case "usage_sessions":
+      return [TABLES.apple.usage_sessions];
+    case "technographics":
+      return [TABLES.apple.technographics_overview];
+    case "revenue":
+      return [TABLES.apple.revenue];
+    case "audience":
+      return [TABLES.apple.audience];
+    case "all":
+      return [
+        TABLES.apple.overview,
+        TABLES.apple.reviews,
+        TABLES.apple.usage_sessions,
+        TABLES.apple.technographics_overview,
+        TABLES.apple.revenue,
+        TABLES.apple.audience,
+      ];
+    default:
+      return [TABLES.apple.overview];
+  }
+}
+
+async function querySelectionStats({ bq, monthStr, country, tab }) {
   const countryInt = mustInt(country, "--country");
+  const tables = appleDestTablesForTab(String(tab || "overview"));
+
+  const joins = tables
+    .map(
+      (tableId, i) => `
+      LEFT JOIN (
+        SELECT DISTINCT app_id
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
+        WHERE month = @month
+          AND country = @country
+          AND google_package IS NULL
+      ) t${i} ON t${i}.app_id = c.app_id`
+    )
+    .join("\n");
+
+  const missingCond = tables.map((_, i) => `t${i}.app_id IS NULL`).join(" OR ");
 
   const query = `
-    WITH meta AS (
+    WITH base AS (
+      SELECT DISTINCT app_id
+      FROM \`${PROJECT_ID}.${DATASET_ID}.app_urls_raw\`
+      WHERE app_id IS NOT NULL
+    ),
+    meta AS (
       SELECT
         app_id,
-        MAX(CAST(user_rating_count AS INT64)) AS user_rating_count_max,
-        MAX(
-          COALESCE(
-            SAFE_CAST(current_version_release_date AS DATE),
-            DATE(SAFE_CAST(current_version_release_date AS TIMESTAMP))
-          )
-        ) AS release_date
+        MAX(IF(LOWER(CAST(country AS STRING)) = 'us', 1, 0)) AS has_us,
+        MAX(SAFE_CAST(user_rating_count AS INT64)) AS user_rating_count_max
       FROM \`${PROJECT_ID}.${DATASET_ID}.app_metadata_by_country\`
       WHERE app_id IS NOT NULL
       GROUP BY app_id
     ),
     candidates AS (
       SELECT
-        app_id,
-        user_rating_count_max,
-        release_date,
-        DATE_DIFF(CURRENT_DATE('UTC'), release_date, DAY) AS days_ago,
-        CASE
-          WHEN DATE_DIFF(CURRENT_DATE('UTC'), release_date, DAY) BETWEEN 0 AND 30 THEN 1
-          WHEN DATE_DIFF(CURRENT_DATE('UTC'), release_date, DAY) BETWEEN 31 AND 365 THEN 2
-          ELSE 99
-        END AS tier
-      FROM meta
-      WHERE release_date IS NOT NULL
-        AND DATE_DIFF(CURRENT_DATE('UTC'), release_date, DAY) BETWEEN 0 AND 365
+        b.app_id,
+        COALESCE(m.has_us, 0) AS has_us,
+        COALESCE(m.user_rating_count_max, 0) AS user_rating_count_max
+      FROM base b
+      LEFT JOIN meta m
+        ON m.app_id = b.app_id
+    ),
+    joined AS (
+      SELECT
+        c.*,
+        (${missingCond}) AS is_missing
+      FROM candidates c
+      ${joins}
     )
-    SELECT c.app_id
-    FROM candidates c
-    LEFT JOIN \`${PROJECT_ID}.${DATASET_ID}.${TABLES.apple.overview}\` s
-      ON s.app_id = c.app_id
-     AND s.month = @month
-     AND s.country = @country
-    WHERE s.app_id IS NULL
-      AND c.tier IN (1, 2)
-    ORDER BY c.tier ASC, c.user_rating_count_max DESC, c.app_id ASC
+    SELECT
+      COUNT(*) AS candidates_total,
+      COUNTIF(is_missing) AS missing_total,
+      ARRAY_AGG(CAST(app_id AS INT64) ORDER BY has_us DESC, user_rating_count_max DESC, app_id ASC LIMIT 10) AS candidates_sample,
+      ARRAY_AGG(IF(is_missing, CAST(app_id AS INT64), NULL) IGNORE NULLS ORDER BY has_us DESC, user_rating_count_max DESC, app_id ASC LIMIT 10) AS missing_sample
+    FROM joined
+  `;
+
+  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt } });
+  const r = rows?.[0] || {};
+  return {
+    candidates_total: Number(r.candidates_total || 0),
+    missing_total: Number(r.missing_total || 0),
+    candidates_sample: Array.isArray(r.candidates_sample) ? r.candidates_sample.map(Number) : [],
+    missing_sample: Array.isArray(r.missing_sample) ? r.missing_sample.map(Number) : [],
+  };
+}
+
+async function querySelectedAppIds({ bq, mode, limit, monthStr, country, tab }) {
+  void mode;
+  const limitInt = mustInt(limit, "--limit");
+  const countryInt = mustInt(country, "--country");
+  const tables = appleDestTablesForTab(String(tab || "overview"));
+
+  const joins = tables
+    .map(
+      (tableId, i) => `
+      LEFT JOIN (
+        SELECT DISTINCT app_id
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
+        WHERE month = @month
+          AND country = @country
+          AND google_package IS NULL
+      ) t${i} ON t${i}.app_id = c.app_id`
+    )
+    .join("\n");
+
+  const missingCond = tables.map((_, i) => `t${i}.app_id IS NULL`).join(" OR ");
+
+  const query = `
+    WITH base AS (
+      SELECT DISTINCT app_id
+      FROM \`${PROJECT_ID}.${DATASET_ID}.app_urls_raw\`
+      WHERE app_id IS NOT NULL
+    ),
+    meta AS (
+      SELECT
+        app_id,
+        MAX(IF(LOWER(CAST(country AS STRING)) = 'us', 1, 0)) AS has_us,
+        MAX(SAFE_CAST(user_rating_count AS INT64)) AS user_rating_count_max
+      FROM \`${PROJECT_ID}.${DATASET_ID}.app_metadata_by_country\`
+      WHERE app_id IS NOT NULL
+      GROUP BY app_id
+    ),
+    candidates AS (
+      SELECT
+        b.app_id,
+        COALESCE(m.has_us, 0) AS has_us,
+        COALESCE(m.user_rating_count_max, 0) AS user_rating_count_max
+      FROM base b
+      LEFT JOIN meta m
+        ON m.app_id = b.app_id
+    ),
+    joined AS (
+      SELECT
+        c.*,
+        (${missingCond}) AS is_missing
+      FROM candidates c
+      ${joins}
+    )
+    SELECT app_id
+    FROM joined
+    WHERE is_missing
+    ORDER BY has_us DESC, user_rating_count_max DESC, app_id ASC
     LIMIT @limit
   `;
 
-  const [rows] = await bq.query({
-    query,
-    params: { month: monthStr, country: countryInt, limit: limitInt },
-  });
+  const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt, limit: limitInt } });
   return rows.map((r) => Number(r.app_id)).filter((n) => Number.isFinite(n));
 }
 
@@ -652,7 +836,7 @@ async function fetchAndInsert({
   const pageUrl = buildSimilarwebUrl(route, query);
 
   try {
-        const { text } = await http.fetchRscText(pageUrl);
+    const { text } = await http.fetchRscText(pageUrl);
     const rawRsc = truncateForBigQueryString(text);
 
     const parsed = parser ? parser(text) : {};
@@ -673,7 +857,7 @@ async function fetchAndInsert({
 
     return { skipped: false, pageUrl, text, parsed };
   } catch (err) {
-    if (isPlaywrightTimeout(err)) await pw.recreatePage().catch(() => {});
+
     await insertAlert(
       bq,
       {
@@ -738,7 +922,7 @@ async function scrapeTechnographicsSdks({
     await insertRows(table, newRows);
     return { inserted: newRows.length, pageUrl };
   } catch (err) {
-    if (isPlaywrightTimeout(err)) await pw.recreatePage().catch(() => {});
+
     await insertAlert(
       bq,
       {
@@ -1088,6 +1272,7 @@ function pickBestJsonPayload(payloads) {
 async function scrapeOverviewWithNetwork({
   bq,
   tableId,
+  writeToBq = true,
   store,
   id,
   monthStr,
@@ -1228,7 +1413,7 @@ async function scrapeOverviewWithNetwork({
         );
         await pw.recreatePage().catch(() => {});
         await pw.recreatePage().catch(() => {});
-      return { skipped: true, pageUrl, googlePackageHint: null };
+      return { ok: false, status: "NAV_TIMEOUT", details: "timeout", pageUrl, googlePackageHint: null }
       }
     }
 
@@ -1248,7 +1433,7 @@ async function scrapeOverviewWithNetwork({
         alertsLogPath
       );
       await pw.recreatePage().catch(() => {});
-      return { skipped: true, pageUrl, googlePackageHint: null };
+      return { ok: false, status: "NAV_TIMEOUT", details: "timeout", pageUrl, googlePackageHint: null }
     }
 
 
@@ -1359,29 +1544,21 @@ async function scrapeOverviewWithNetwork({
         alertsLogPath
       );
 
-      return { skipped: false, pageUrl, googlePackageHint };
+      return { ok: false, status: "NO_DATA", details: "metrics_not_found", pageUrl, googlePackageHint }
     }
 
     const rawText =
       bestKind === "json" ? safeStringify(best.payload.body) : best.payload.text ? String(best.payload.text) : null;
 
-    const table = bq.dataset(DATASET_ID).table(tableId);
-    await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
-    await insertRows(table, [      {
-        month: monthStr,
-        country,
-        pulled_at: new Date().toISOString(),
-        app_id: appId,
-        google_package: googlePackage || null,
-        ...best.metrics,
-        page_url: pageUrl,
-        raw_rsc_text: truncateForBigQueryString(rawText),
-      },
-    ]);
+    if (writeToBq) {
+      const table = bq.dataset(DATASET_ID).table(tableId);
+      await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
+    await insertRows(table, [row]);
+    }
 
-    return { skipped: false, pageUrl, googlePackageHint };
+    return { ok: true, status: "SUCCESS", details: writeToBq ? (bestKind ?? null) : "no_write", pageUrl, googlePackageHint }
   } catch (err) {
-    if (isPlaywrightTimeout(err)) await pw.recreatePage().catch(() => {});
+
     await insertAlert(
       bq,
       {
@@ -1409,12 +1586,16 @@ async function scrapeOverviewWithNetwork({
 async function main() {
   const argv = minimist(process.argv.slice(2), {
     boolean: ["dry_run", "headful", "debug_network"],
-    string: ["month", "mode", "country"],
-    default: { limit: 150, mode: "backfill", country: String(COUNTRY_DEFAULT), dry_run: false, headful: false, debug_network: false, workers: 1, worker: 0 },
+    string: ["month", "mode", "country", "tab", "profile_dir"],
+    default: { limit: 150, mode: "backfill", tab: "overview", country: String(COUNTRY_DEFAULT), dry_run: false, headful: false, debug_network: false, workers: 1, worker: 0 },
   });
 
   const mode = String(argv.mode || "backfill");
   if (!["backfill", "weekly"].includes(mode)) throw new Error(`Invalid --mode: ${mode}`);
+
+  const tab = String(argv.tab || "overview");
+  const supportedTabs = new Set(["overview", "reviews", "usage_sessions", "technographics", "revenue", "audience", "all"]);
+  if (!supportedTabs.has(tab)) throw new Error(`Invalid --tab: ${tab}`);
 
   const limit = mustInt(argv.limit ?? 150, "--limit");
   const country = mustInt(argv.country ?? COUNTRY_DEFAULT, "--country");
@@ -1427,6 +1608,7 @@ async function main() {
   const headful = Boolean(argv.headful);
   const debugNetwork = Boolean(argv.debug_network);
 
+  const wantTab = (name) => tab === "all" || tab === name;
   const profileDirArg = argv.profile_dir != null ? String(argv.profile_dir) : null;
 
   const monthDate = argv.month ? monthFromYyyyMm(argv.month) : previousFullMonthUtc();
@@ -1444,25 +1626,28 @@ async function main() {
   const storageStatePath = path.join(baseSessionDir, "storageState.json");
   const userDataDir = profileDirArg ? baseSessionDir : null;
 
+  const runId = generateRunId({ worker, workers });
+  process.stdout.write('Run id: ' + runId + String.fromCharCode(10));
   process.stdout.write(`Shard worker ${worker}/${workers}\n`);
 
   // Ensure Similarweb session is valid (auto relogin headful if expired).
   const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320?country=999&from=2026-01-01&to=2026-01-31&window=false";
   await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, userDataDir, storageStatePath, cookiesPath });
 
+  let pw = null;
   try {
     await fs.access(cookiesPath);
     await fs.access(storageStatePath);
-  let pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
-
+    pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
   } catch {
     throw new Error("Missing Similarweb session files. Run `node tools/similarweb_login.js` first (or pass --profile_dir to use a separate session)." );
   }
 
   const bq = createBigQueryClient();
   await ensureSchemas(bq);
-  const processedAlreadyCount = await queryProcessedAlreadyCount({ bq, monthStr, country });
-  const selectedAppIdsAll = await querySelectedAppIds({ bq, mode, limit, monthStr, country });
+  const selectionStats = await querySelectionStats({ bq, monthStr, country, tab });
+  const processedAlreadyCount = await queryProcessedAlreadyCount({ bq, monthStr, country, tab });
+  const selectedAppIdsAll = await querySelectedAppIds({ bq, mode, limit, monthStr, country, tab });
   const shardSkippedCount = selectedAppIdsAll.reduce((acc, appId) => acc + (shardBucketForAppId(appId, workers) !== worker ? 1 : 0), 0);
   const selectedAppIds = selectedAppIdsAll.filter((appId) => shardBucketForAppId(appId, workers) === worker);
 
@@ -1477,7 +1662,11 @@ async function main() {
           limit,
           workers,
           worker,
-          candidates_total: selectedAppIdsAll.length,
+      selection_candidates_total: selectionStats.candidates_total,
+      selection_missing_total: selectionStats.missing_total,
+      selection_candidates_sample: selectionStats.candidates_sample,
+      selection_missing_sample: selectionStats.missing_sample,
+      candidates_total: selectedAppIdsAll.length,
           skipped_by_shard: shardSkippedCount,
           selected_count: selectedAppIds.length,
           processed_already_count: processedAlreadyCount,
@@ -1502,6 +1691,10 @@ async function main() {
       limit,
       workers,
       worker,
+      selection_candidates_total: selectionStats.candidates_total,
+      selection_missing_total: selectionStats.missing_total,
+      selection_candidates_sample: selectionStats.candidates_sample,
+      selection_missing_sample: selectionStats.missing_sample,
       candidates_total: selectedAppIdsAll.length,
       skipped_by_shard: shardSkippedCount,
       selected_count: selectedAppIds.length,
@@ -1513,77 +1706,196 @@ async function main() {
   const reloginRetriedAppIds = new Set();
   const t0 = Date.now();
 
-  appsLoop: for (let i = 0; i < selectedAppIds.length; i += 1) {
-    const appId = selectedAppIds[i];
-    const idx1 = i + 1;
-    const appStart = Date.now();
+  const counters = {
+    candidates_total: selectionStats.candidates_total,
+    missing_total: selectionStats.missing_total,
+    selected_total: selectedAppIdsAll.length,
+    shard_selected_total: selectedAppIds.length,
+    skipped_by_shard: shardSkippedCount,
+    attempted_apps: 0,
+    attempted_tabs: 0,
+    success: 0,
+    no_data: 0,
+    skipped_exists: 0,
+    errors: 0,
+    parse_error: 0,
+    nav_timeout: 0,
+    login_expired: 0,
+    captcha: 0,
+    bq_error: 0,
+    http_error: 0,
+  };
 
-    const commonQuery = { country, from: fromStr, to: toStr, window: "false" };
+  const auditTable = bq.dataset(DATASET_ID).table(TABLES.audit);
+  const auditBuffer = [];
+  const AUDIT_BATCH_SIZE = 300;
 
-    let retrySameApp = false;
+  async function flushAudit() {
+    if (!auditBuffer.length) return;
+    const batch = auditBuffer.splice(0, auditBuffer.length);
+    try {
+      await insertRows(auditTable, batch);
+    } catch (err) {
+      await appendLine(runLogPath, JSON.stringify({ event: 'audit_insert_error', at: nowIso(), run_id: runId, rows: batch.length, error: formatErrorMessage(err) }));
+    }
+  }
+
+  async function pushAuditRow(row) {
+    auditBuffer.push(row);
+    if (auditBuffer.length >= AUDIT_BATCH_SIZE) await flushAudit();
+  }
+
+  async function recordAudit({ store, tabName, appId, googlePackage, status, details, pageUrl, durationMs, attemptNum }) {
+    counters.attempted_tabs += 1;
+    if (status === "SUCCESS") counters.success += 1;
+    else if (status === "NO_DATA") counters.no_data += 1;
+    else if (status === "SKIPPED_ALREADY_EXISTS") counters.skipped_exists += 1;
+    else {
+      counters.errors += 1;
+      if (status === "LOGIN_EXPIRED") counters.login_expired += 1;
+      else if (status === "CAPTCHA") counters.captcha += 1;
+      else if (status === "NAV_TIMEOUT") counters.nav_timeout += 1;
+      else if (status === "BQ_ERROR") counters.bq_error += 1;
+      else if (status === "HTTP_ERROR") counters.http_error += 1;
+      else counters.parse_error += 1;
+    }
+
+    await pushAuditRow({
+      run_id: runId,
+      pulled_at: nowIso(),
+      store,
+      tab: tabName,
+      month: monthStr,
+      country,
+      app_id: appId,
+      google_package: googlePackage || null,
+      status,
+      details: truncateDetails(details, 2000),
+      page_url: pageUrl || null,
+      duration_ms: durationMs == null ? null : Math.trunc(durationMs),
+      attempt_num: attemptNum,
+    });
+  }
+
+
+  function isFatalSimilarwebError(err) {
+    const code = err?.code || null;
+    return code === "SW_LOGIN_EXPIRED" || code === "SW_BLOCKED" || code === "SW_TOO_MANY_429" || code === "SW_TOO_MANY_403";
+  }
+
+  async function runOverviewTab({ store, tableId, id, appId, googlePackage }) {
+    const pageUrl = buildSimilarwebUrl(`/app-analysis/overview/${store}/${id}`, {
+      country,
+      from: fromStr,
+      to: toStr,
+      window: "false",
+    });
+    const started = Date.now();
 
     try {
-      const appleOverview = await scrapeOverviewWithNetwork({
+      const exists = await rowExists(bq, tableId, { monthStr, country, appId, googlePackage });
+      if (exists) {
+        await recordAudit({ store, tabName: "overview", appId, googlePackage, status: "SKIPPED_ALREADY_EXISTS", details: "exists", pageUrl, durationMs: Date.now() - started, attemptNum });
+        return { skipped: true };
+      }
+
+      const res = await scrapeOverviewWithNetwork({
         bq,
-        tableId: TABLES.apple.overview,
-        store: "apple",
-        id: String(appId),
+        tableId,
+        store,
+        id,
         monthStr,
         country,
         fromStr,
         toStr,
         appId,
-        googlePackage: null,
-        storageStatePath,
-        headful,
+        googlePackage,
+        writeToBq: true,
+        pw,
         debugNetwork,
         alertsLogPath,
       });
 
-      await fetchAndInsert({
-        http,
-        bq,
-        tableId: TABLES.apple.reviews,
-        store: "apple",
-        tab: "reviews",
-        route: `/app-analysis/reviews/apple/${appId}`,
-        query: commonQuery,
-        monthStr,
-        country,
-        appId,
-        googlePackage: null,
-        parser: (t) => parseReviewsReplyRate(t),
-        alertsLogPath,
-      });
+      if (!res?.ok) {
+        await recordAudit({ store, tabName: "overview", appId, googlePackage, status: res?.status || "NO_DATA", details: res?.details || "no_data", pageUrl, durationMs: Date.now() - started, attemptNum });
+        return { ok: false };
+      }
+
+      await recordAudit({ store, tabName: "overview", appId, googlePackage, status: "SUCCESS", details: res?.details || null, pageUrl, durationMs: Date.now() - started, attemptNum });
+      return { ok: true, pageUrl, googlePackageHint: res?.googlePackageHint || null };
+    } catch (err) {
+      const status = classifyAuditStatus(err);
+      await recordAudit({ store, tabName: "overview", appId, googlePackage, status, details: formatErrorMessage(err), pageUrl, durationMs: Date.now() - started, attemptNum });
+      if (isFatalSimilarwebError(err)) throw err;
+      return { ok: false };
+    }
+  }
+
+  async function runRscTab({ store, tabName, alertsTab = null, tableId, route, query, appId, googlePackage, parser }) {
+    const pageUrl = buildSimilarwebUrl(route, query);
+    const started = Date.now();
+
+    try {
+      const exists = await rowExists(bq, tableId, { monthStr, country, appId, googlePackage });
+      if (exists) {
+        await recordAudit({ store, tabName, appId, googlePackage, status: "SKIPPED_ALREADY_EXISTS", details: "exists", pageUrl, durationMs: Date.now() - started, attemptNum });
+        return { skipped: true };
+      }
 
       await fetchAndInsert({
         http,
         bq,
-        tableId: TABLES.apple.usage_sessions,
-        store: "apple",
-        tab: "usage-and-engagement",
-        route: `/app-analysis/usage-and-engagement/apple/${appId}`,
-        query: commonQuery,
+        tableId,
+        store,
+        tab: alertsTab || tabName,
+        route,
+        query,
         monthStr,
         country,
         appId,
-        googlePackage: null,
-        parser: (t) => parseUsageSessions(t),
+        googlePackage,
+        parser,
         alertsLogPath,
       });
+
+      await recordAudit({ store, tabName, appId, googlePackage, status: "SUCCESS", details: null, pageUrl, durationMs: Date.now() - started, attemptNum });
+      return { ok: true };
+    } catch (err) {
+      const status = classifyAuditStatus(err);
+      await recordAudit({ store, tabName, appId, googlePackage, status, details: formatErrorMessage(err), pageUrl, durationMs: Date.now() - started, attemptNum });
+      if (isFatalSimilarwebError(err)) throw err;
+      return { ok: false };
+    }
+  }
+
+  async function runTechnographicsTab({ store, id, appId, googlePackage }) {
+    const route = `/app-analysis/technographics/${store}/${id}`;
+    const query = { country, from: fromStr, to: toStr, window: "false" };
+    const pageUrl = buildSimilarwebUrl(route, query);
+    const started = Date.now();
+
+    const tableId = store === "apple" ? TABLES.apple.technographics_overview : TABLES.google.technographics_overview;
+    const sdksTableId = store === "apple" ? TABLES.apple.technographics_sdks : TABLES.google.technographics_sdks;
+
+    try {
+      const exists = await rowExists(bq, tableId, { monthStr, country, appId, googlePackage });
+      if (exists) {
+        await recordAudit({ store, tabName: "technographics", appId, googlePackage, status: "SKIPPED_ALREADY_EXISTS", details: "exists", pageUrl, durationMs: Date.now() - started, attemptNum });
+        return { skipped: true };
+      }
 
       await fetchAndInsert({
         http,
         bq,
-        tableId: TABLES.apple.technographics_overview,
-        store: "apple",
+        tableId,
+        store,
         tab: "technographics",
-        route: `/app-analysis/technographics/apple/${appId}`,
-        query: commonQuery,
+        route,
+        query,
         monthStr,
         country,
         appId,
-        googlePackage: null,
+        googlePackage,
         parser: (t) => parseTechnographicsOverview(t),
         alertsLogPath,
       });
@@ -1591,52 +1903,124 @@ async function main() {
       await scrapeTechnographicsSdks({
         http,
         bq,
-        store: "apple",
-        id: String(appId),
+        store,
+        id,
         monthStr,
         country,
         fromStr,
         toStr,
         appId,
-        googlePackage: null,
-        tableId: TABLES.apple.technographics_sdks,
+        googlePackage,
+        tableId: sdksTableId,
         alertsLogPath,
       });
 
-      await fetchAndInsert({
-        http,
-        bq,
-        tableId: TABLES.apple.revenue,
-        store: "apple",
-        tab: "revenue",
-        route: `/app-analysis/revenue/apple/${appId}`,
-        query: commonQuery,
-        monthStr,
-        country,
-        appId,
-        googlePackage: null,
-        parser: (t) => parseRevenueTotal(t),
-        alertsLogPath,
-      });
+      await recordAudit({ store, tabName: "technographics", appId, googlePackage, status: "SUCCESS", details: null, pageUrl, durationMs: Date.now() - started, attemptNum });
+      return { ok: true };
+    } catch (err) {
+      const status = classifyAuditStatus(err);
+      await recordAudit({ store, tabName: "technographics", appId, googlePackage, status, details: formatErrorMessage(err), pageUrl, durationMs: Date.now() - started, attemptNum });
+      if (isFatalSimilarwebError(err)) throw err;
+      return { ok: false };
+    }
+  }
+  appsLoop: for (let i = 0; i < selectedAppIds.length; i += 1) {
+    const appId = selectedAppIds[i];
+    const idx1 = i + 1;
+    const appStart = Date.now();
+    const attemptNum = (attemptByAppId.get(appId) || 0) + 1;
+    attemptByAppId.set(appId, attemptNum);
 
-      await fetchAndInsert({
-        http,
-        bq,
-        tableId: TABLES.apple.audience,
-        store: "apple",
-        tab: "audience-analysis",
-        route: `/app-analysis/audience-analysis/apple/${appId}`,
-        query: commonQuery,
-        monthStr,
-        country,
-        appId,
-        googlePackage: null,
-        parser: (t) => parseAudience(t),
-        alertsLogPath,
-      });
+    counters.attempted_apps += 1;
 
+    const commonQuery = { country, from: fromStr, to: toStr, window: "false" };
+
+    let retrySameApp = false;
+
+    try {
       let googlePackage = await lookupGooglePackageFromMap(bq, appId);
+
+      let appleOverview = null;
+      if (wantTab("overview")) {
+        appleOverview = await runOverviewTab({ store: "apple", tableId: TABLES.apple.overview, id: String(appId), appId, googlePackage: null });
+      } else if (!googlePackage) {
+        appleOverview = await scrapeOverviewWithNetwork({
+          bq,
+          tableId: TABLES.apple.overview,
+          store: "apple",
+          id: String(appId),
+          monthStr,
+          country,
+          fromStr,
+          toStr,
+          appId,
+          googlePackage: null,
+          writeToBq: false,
+          pw,
+          debugNetwork,
+          alertsLogPath,
+        });
+      }
+
       if (!googlePackage && appleOverview?.googlePackageHint) googlePackage = appleOverview.googlePackageHint;
+
+      if (wantTab("reviews")) {
+        await runRscTab({
+          store: "apple",
+          tabName: "reviews",
+          tableId: TABLES.apple.reviews,
+          route: `/app-analysis/reviews/apple/${appId}`,
+          query: commonQuery,
+          appId,
+          googlePackage: null,
+          parser: (t) => parseReviewsReplyRate(t),
+        });
+      }
+
+      if (wantTab("usage_sessions")) {
+        await runRscTab({
+          store: "apple",
+          tabName: "usage_sessions",
+          alertsTab: "usage-and-engagement",
+          tableId: TABLES.apple.usage_sessions,
+          route: `/app-analysis/usage-and-engagement/apple/${appId}`,
+          query: commonQuery,
+          appId,
+          googlePackage: null,
+          parser: (t) => parseUsageSessions(t),
+        });
+      }
+
+      if (wantTab("technographics")) {
+        await runTechnographicsTab({ store: "apple", id: String(appId), appId, googlePackage: null });
+      }
+
+      if (wantTab("revenue")) {
+        await runRscTab({
+          store: "apple",
+          tabName: "revenue",
+          tableId: TABLES.apple.revenue,
+          route: `/app-analysis/revenue/apple/${appId}`,
+          query: commonQuery,
+          appId,
+          googlePackage: null,
+          parser: (t) => parseRevenueTotal(t),
+        });
+      }
+
+      if (wantTab("audience")) {
+        await runRscTab({
+          store: "apple",
+          tabName: "audience",
+          alertsTab: "audience-analysis",
+          tableId: TABLES.apple.audience,
+          route: `/app-analysis/audience-analysis/apple/${appId}`,
+          query: commonQuery,
+          appId,
+          googlePackage: null,
+          parser: (t) => parseAudience(t),
+        });
+      }
       if (!googlePackage) {
         try {
           googlePackage = await resolveGooglePackageViaPlaywright({ appId, country, fromDate: from, toDate: to, headful, storageStatePath, userDataDir });
@@ -1661,117 +2045,67 @@ async function main() {
       if (googlePackage) {
         await upsertMapRow(bq, { appId, googlePackage, sourceUrl: appleOverview?.pageUrl || null });
 
-        await scrapeOverviewWithNetwork({
-          bq,
-          tableId: TABLES.google.overview,
-          store: "google",
-          id: googlePackage,
-          monthStr,
-          country,
-          fromStr,
-          toStr,
-          appId,
-          googlePackage,
-          storageStatePath,
-          headful,
-          debugNetwork,
-          alertsLogPath,
-        });
+        if (wantTab("overview")) {
+          await runOverviewTab({ store: "google", tableId: TABLES.google.overview, id: googlePackage, appId, googlePackage });
+        }
 
-        await fetchAndInsert({
-          http,
-          bq,
-          tableId: TABLES.google.reviews,
-          store: "google",
-          tab: "reviews",
-          route: `/app-analysis/reviews/google/${googlePackage}`,
-          query: commonQuery,
-          monthStr,
-          country,
-          appId,
-          googlePackage,
-          parser: (t) => parseReviewsReplyRate(t),
-          alertsLogPath,
-        });
+        if (wantTab("reviews")) {
+          await runRscTab({
+            store: "google",
+            tabName: "reviews",
+            tableId: TABLES.google.reviews,
+            route: `/app-analysis/reviews/google/${googlePackage}`,
+            query: commonQuery,
+            appId,
+            googlePackage,
+            parser: (t) => parseReviewsReplyRate(t),
+          });
+        }
 
-        await fetchAndInsert({
-          http,
-          bq,
-          tableId: TABLES.google.usage_sessions,
-          store: "google",
-          tab: "usage-and-engagement",
-          route: `/app-analysis/usage-and-engagement/google/${googlePackage}`,
-          query: commonQuery,
-          monthStr,
-          country,
-          appId,
-          googlePackage,
-          parser: (t) => parseUsageSessions(t),
-          alertsLogPath,
-        });
+        if (wantTab("usage_sessions")) {
+          await runRscTab({
+            store: "google",
+            tabName: "usage_sessions",
+            alertsTab: "usage-and-engagement",
+            tableId: TABLES.google.usage_sessions,
+            route: `/app-analysis/usage-and-engagement/google/${googlePackage}`,
+            query: commonQuery,
+            appId,
+            googlePackage,
+            parser: (t) => parseUsageSessions(t),
+          });
+        }
 
-        await fetchAndInsert({
-          http,
-          bq,
-          tableId: TABLES.google.technographics_overview,
-          store: "google",
-          tab: "technographics",
-          route: `/app-analysis/technographics/google/${googlePackage}`,
-          query: commonQuery,
-          monthStr,
-          country,
-          appId,
-          googlePackage,
-          parser: (t) => parseTechnographicsOverview(t),
-          alertsLogPath,
-        });
+        if (wantTab("technographics")) {
+          await runTechnographicsTab({ store: "google", id: googlePackage, appId, googlePackage });
+        }
 
-        await scrapeTechnographicsSdks({
-          http,
-          bq,
-          store: "google",
-          id: googlePackage,
-          monthStr,
-          country,
-          fromStr,
-          toStr,
-          appId,
-          googlePackage,
-          tableId: TABLES.google.technographics_sdks,
-          alertsLogPath,
-        });
+        if (wantTab("revenue")) {
+          await runRscTab({
+            store: "google",
+            tabName: "revenue",
+            tableId: TABLES.google.revenue,
+            route: `/app-analysis/revenue/google/${googlePackage}`,
+            query: commonQuery,
+            appId,
+            googlePackage,
+            parser: (t) => parseRevenueTotal(t),
+          });
+        }
 
-        await fetchAndInsert({
-          http,
-          bq,
-          tableId: TABLES.google.revenue,
-          store: "google",
-          tab: "revenue",
-          route: `/app-analysis/revenue/google/${googlePackage}`,
-          query: commonQuery,
-          monthStr,
-          country,
-          appId,
-          googlePackage,
-          parser: (t) => parseRevenueTotal(t),
-          alertsLogPath,
-        });
-
-        await fetchAndInsert({
-          http,
-          bq,
-          tableId: TABLES.google.audience,
-          store: "google",
-          tab: "audience-analysis",
-          route: `/app-analysis/audience-analysis/google/${googlePackage}`,
-          query: commonQuery,
-          monthStr,
-          country,
-          appId,
-          googlePackage,
-          parser: (t) => parseAudience(t),
-          alertsLogPath,
-        });
+        if (wantTab("audience")) {
+          await runRscTab({
+            store: "google",
+            tabName: "audience",
+            alertsTab: "audience-analysis",
+            tableId: TABLES.google.audience,
+            route: `/app-analysis/audience-analysis/google/${googlePackage}`,
+            query: commonQuery,
+            appId,
+            googlePackage,
+            parser: (t) => parseAudience(t),
+          });
+        }
       } else {
         await insertAlert(
           bq,
@@ -1878,11 +2212,24 @@ async function main() {
         JSON.stringify({ event: "app_done", at: nowIso(), app_id: appId, ms: Date.now() - appStart })
       );
 
+      await flushAudit();
+
       await sleep(jitter(2000, 4000));
     }
   }
 
-  await appendLine(runLogPath, JSON.stringify({ event: "done", at: nowIso() }));
+  await flushAudit();
+
+  await appendLine(
+    runLogPath,
+    JSON.stringify({ event: 'summary', at: nowIso(), run_id: runId, tab, month: monthStr, country, worker, workers, counters })
+  );
+
+  process.stdout.write(String.fromCharCode(10) + 'Summary: ' + JSON.stringify(counters) + String.fromCharCode(10));
+
+  await appendLine(runLogPath, JSON.stringify({ event: 'done', at: nowIso(), run_id: runId }));
+
+  if (pw) await pw.close().catch(() => {});
 }
 
 main().catch((err) => {
@@ -1890,6 +2237,38 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
