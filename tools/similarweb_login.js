@@ -45,15 +45,40 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
       const low = cur.toLowerCase();
 
       // Do not interrupt the user while they are in login / MFA / password reset flows.
+      const mfaInputVisible = await page
+        .locator("input[autocomplete=one-time-code], input[type=tel], input[name*=code], input[id*=code]")
+        .first()
+        .isVisible({ timeout: 500 })
+        .catch(() => false);
+
+      const activeIsInput = await page
+        .evaluate(() => {
+          const el = document && document.activeElement ? document.activeElement : null;
+          const tag = el && el.tagName ? String(el.tagName).toUpperCase() : "";
+          return tag === "INPUT" || tag === "TEXTAREA";
+        })
+        .catch(() => false);
+
+      // Do not interrupt the user while they are in login / MFA / password reset flows.
       const inAuthFlow =
         looksLikeLoginUrl(cur) ||
         low.includes("password") ||
         low.includes("reset") ||
         low.includes("new-password") ||
-        low.includes("change-password");
+        low.includes("change-password") ||
+        low.includes("mfa") ||
+        low.includes("2fa") ||
+        low.includes("twofactor") ||
+        low.includes("two-factor") ||
+        low.includes("otp") ||
+        low.includes("verification") ||
+        low.includes("verify") ||
+        low.includes("challenge") ||
+        mfaInputVisible ||
+        activeIsInput;
 
       if (inAuthFlow) {
-        await page.waitForTimeout(3000);
+        await page.waitForTimeout(5000);
         continue;
       }
 
