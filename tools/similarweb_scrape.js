@@ -1562,8 +1562,18 @@ async function scrapeOverviewWithNetwork({
 
     if (writeToBq) {
       const table = bq.dataset(DATASET_ID).table(tableId);
+      const row = {
+        month: monthStr,
+        country,
+        pulled_at: new Date().toISOString(),
+        app_id: appId,
+        google_package: googlePackage || null,
+        ...best.metrics,
+        page_url: pageUrl,
+        raw_rsc_text: truncateForBigQueryString(rawText),
+      };
       await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
-    await insertRows(table, [row]);
+      await insertRows(table, [row]);
     }
 
     return { ok: true, status: "SUCCESS", details: writeToBq ? (bestKind ?? null) : "no_write", pageUrl, googlePackageHint }
