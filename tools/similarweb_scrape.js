@@ -921,6 +921,7 @@ async function fetchAndInsert({
   googlePackage,
   parser,
   alertsLogPath,
+  runLogPath = null,
   pwPage = null,
   domTabName = null,
 }) {
@@ -933,13 +934,14 @@ async function fetchAndInsert({
 
   try {
     try {
-      const r = await http.fetchRscText(pageUrl);
+      const r = await http.fetchRscText(pageUrl, { maxAttempts: pwPage ? 1 : 3 });
       text = r && r.text != null ? String(r.text) : null;
     } catch (err) {
       // Fallback to DOM if HTTP/RSC fails (Similarweb sometimes returns 500 for RSC routes).
       if (pwPage) {
         text = await fetchDomTextForTab(pwPage, pageUrl, effectiveTab);
         usedDomFallback = true;
+        if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_fallback", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: pageUrl, reason: err?.code || err?.httpStatus || "http_error" }));
       } else {
         throw err;
       }
@@ -961,6 +963,7 @@ async function fetchAndInsert({
         text = domText;
         parsed = domParsed;
         usedDomFallback = true;
+        if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_fallback_shell", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: pageUrl }));
       }
     }
 
@@ -985,6 +988,7 @@ async function fetchAndInsert({
     const table = bq.dataset(DATASET_ID).table(tableId);
     await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
     await insertRows(table, [row]);
+    if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "tab_insert", at: nowIso(), store, tab: effectiveTab, table: tableId, rows: 1, app_id: appId, google_package: googlePackage || null, dom_fallback: usedDomFallback }));
 
     return { skipped: false, pageUrl, text, parsed, usedDomFallback };
   } catch (err) {
@@ -2005,6 +2009,7 @@ async function main() {
         googlePackage,
         parser,
         alertsLogPath,
+        runLogPath,
         pwPage: pw?.page,
         domTabName: tabName,
       });
@@ -2049,6 +2054,7 @@ async function main() {
         googlePackage,
         parser: (t) => parseTechnographicsOverview(t),
         alertsLogPath,
+        runLogPath,
         pwPage: pw?.page,
         domTabName: "technographics",
       });
