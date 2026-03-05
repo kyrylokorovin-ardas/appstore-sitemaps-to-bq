@@ -135,15 +135,39 @@ function domWaitPatternsForTab(tabName) {
   return [];
 }
 
+
+function addLangPrefixToSimilarwebUrl(url, lang = "en") {
+  try {
+    const u = new URL(url);
+    const p = u.pathname || "";
+    if (!p.startsWith("/app-analysis/")) return null;
+    if (p.startsWith(`/${lang}/app-analysis/`)) return null;
+    u.pathname = `/${lang}` + p;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
 async function fetchDomTextForTab(page, pageUrl, tabName) {
-  const resp = await page.goto(pageUrl, { waitUntil: "domcontentloaded" }).catch(() => null);
+  let currentUrl = pageUrl;
+  let resp = await page.goto(currentUrl, { waitUntil: "domcontentloaded" }).catch(() => null);
   await page.waitForTimeout(1200).catch(() => {});
-  const status = resp ? resp.status() : null;
+  let status = resp ? resp.status() : null;
   if (status != null && status >= 500) {
-    const e = new Error(`Similarweb returned HTTP ${status} for page`);
-    e.code = "SW_HTTP_ERROR";
-    e.httpStatus = status;
-    throw e;
+    const alt = addLangPrefixToSimilarwebUrl(currentUrl, "en");
+    if (alt) {
+      currentUrl = alt;
+      resp = await page.goto(currentUrl, { waitUntil: "domcontentloaded" }).catch(() => null);
+      await page.waitForTimeout(1200).catch(() => {});
+      status = resp ? resp.status() : null;
+    }
+    if (status != null && status >= 500) {
+      const e = new Error(`Similarweb returned HTTP ${status} for page`);
+      e.code = "SW_HTTP_ERROR";
+      e.httpStatus = status;
+      throw e;
+    }
   }
 
   const hint = await sniffAuthOrBlocked(page);
@@ -165,6 +189,15 @@ async function fetchDomTextForTab(page, pageUrl, tabName) {
   const text = await page.evaluate(() => (document && document.body ? document.body.innerText : ""));
   const textStr = String(text || "");
   if (/internal server error/i.test(textStr)) {
+    const alt = addLangPrefixToSimilarwebUrl(currentUrl, "en");
+    if (alt) {
+      currentUrl = alt;
+      resp = await page.goto(currentUrl, { waitUntil: "domcontentloaded" }).catch(() => null);
+      await page.waitForTimeout(1200).catch(() => {});
+      const t2 = await page.evaluate(() => (document && document.body ? document.body.innerText : ""));
+      const s2 = String(t2 || "");
+      if (!/internal server error/i.test(s2)) return s2;
+    }
     const e = new Error("Similarweb page shows Internal Server Error");
     e.code = "SW_HTTP_ERROR";
     e.httpStatus = 500;
@@ -2459,8 +2492,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
-
 
 
 
