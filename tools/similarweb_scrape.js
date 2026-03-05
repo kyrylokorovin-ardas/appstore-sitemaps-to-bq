@@ -1721,6 +1721,8 @@ async function main() {
   const reloginRetriedAppIds = new Set();
   const t0 = Date.now();
 
+  let attemptNum = 0;
+
   const counters = {
     candidates_total: selectionStats.candidates_total,
     missing_total: selectionStats.missing_total,
@@ -1945,7 +1947,7 @@ async function main() {
     const appId = selectedAppIds[i];
     const idx1 = i + 1;
     const appStart = Date.now();
-    const attemptNum = (attemptByAppId.get(appId) || 0) + 1;
+    attemptNum = (attemptByAppId.get(appId) || 0) + 1;
     attemptByAppId.set(appId, attemptNum);
 
     counters.attempted_apps += 1;
