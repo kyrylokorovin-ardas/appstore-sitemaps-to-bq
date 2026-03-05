@@ -152,6 +152,9 @@ export class SimilarwebHttpClient {
         : `${url}${url.includes("?") ? "&" : "?"}_rsc=${rscToken}`;
 
       const { header: cookieHeader, cookieCount } = cookiesToHeaderForUrl(this.cookies, fullUrl);
+      const u = new URL(fullUrl);
+      const origin = u.protocol + "//" + u.host;
+      const referer = fullUrl.replace(/([?&])_rsc=[^&]+/, "").replace(/[?&]$/, "");
       if (!cookieHeader) {
         const err = new Error(
           `No applicable cookies for ${new URL(fullUrl).hostname}. Re-run node tools/similarweb_login.js to export fresh cookies.`
@@ -176,6 +179,14 @@ export class SimilarwebHttpClient {
           headers: {
             accept: "text/x-component",
             rsc: "1",
+            "accept-language": "en-US,en;q=0.9",
+            origin,
+            referer,
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "cache-control": "no-cache",
+            pragma: "no-cache",
             "user-agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
             cookie: cookieHeader,
@@ -285,3 +296,4 @@ export class SimilarwebHttpClient {
     throw lastErr || new Error("Failed to fetch Similarweb RSC response");
   }
 }
+
