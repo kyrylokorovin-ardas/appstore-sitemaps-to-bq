@@ -42,34 +42,66 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
     let authed = false;
     while (Date.now() < loginDetectDeadline) {
       const cur = page.url() || "";
-      if (looksLikeLoginUrl(cur)) {
+      const low = cur.toLowerCase();
+
+      // Do not interrupt the user while they are in login / MFA / password reset flows.
+      const inAuthFlow =
+        looksLikeLoginUrl(cur) ||
+        low.includes("password") ||
+        low.includes("reset") ||
+        low.includes("new-password") ||
+        low.includes("change-password");
+
+      if (inAuthFlow) {
         await page.waitForTimeout(3000);
         continue;
       }
+
+      // Non-invasive checks (no navigation) to avoid disrupting form input.
       try {
-        const resp = await page.goto(authCheckUrl, { waitUntil: "domcontentloaded" });
-        await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
-        await page.waitForTimeout(1000);
-
-        const finalUrl = page.url() || "";
-        const status = resp ? resp.status() : null;
+        const urlOk = cur.includes("/app-analysis/");
         const cookieStr = await page.evaluate(() => document.cookie || "").catch(() => "");
-
-        const urlOk = finalUrl.includes("/app-analysis/");
         const cookieOk = String(cookieStr).toLowerCase().includes("auth");
-
-        if ((status == null || status < 400) && (urlOk || cookieOk)) {
+        if (urlOk || cookieOk) {
           authed = true;
           break;
         }
       } catch {
-        // ignore and retry
+        // ignore
+      }
+
+      try {
+        const cookies = await context.cookies();
+        const cookieOk = cookies.some((c) => String(c?.name || "").toLowerCase().includes("auth"));
+        if (cookieOk) {
+          authed = true;
+          break;
+        }
+      } catch {
+        // ignore
       }
 
       await page.waitForTimeout(3000);
     }
 
-    if (!authed) {
+    if (authed) {
+      // Confirm by loading a stable app-analysis page once.
+      const resp = await page.goto(authCheckUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
+      await page.waitForTimeout(1000);
+
+      const finalUrl = page.url() || "";
+      const status = resp ? resp.status() : null;
+      const cookieStr = await page.evaluate(() => document.cookie || "").catch(() => "");
+
+      const urlOk = finalUrl.includes("/app-analysis/");
+      const cookieOk = String(cookieStr).toLowerCase().includes("auth");
+      if (!((status == null || status < 400) && (urlOk || cookieOk))) {
+        authed = false;
+      }
+    }
+
+if (!authed) {
       process.stdout.write("LOGIN NOT DETECTED – open any app-analysis page\n");
       throw new Error("Login not detected");
     }
