@@ -1939,6 +1939,8 @@ async function main() {
       return { ok: false };
     }
   }
+  const attemptByAppId = new Map();
+
   appsLoop: for (let i = 0; i < selectedAppIds.length; i += 1) {
     const appId = selectedAppIds[i];
     const idx1 = i + 1;
