@@ -40,8 +40,16 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
     const loginDetectDeadline = Date.now() + 90_000;
     const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320";
     let authed = false;
+    let lastNavAt = 0;
     while (Date.now() < loginDetectDeadline) {
       const cur = page.url() || "";
+
+      // If the user already reached an app-analysis page, consider login detected.
+      if (cur.includes("/app-analysis/") && !looksLikeLoginUrl(cur)) {
+        authed = true;
+        break;
+      }
+
       const low = cur.toLowerCase();
 
       // Do not interrupt the user while they are in login / MFA / password reset flows.
@@ -59,7 +67,6 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
         })
         .catch(() => false);
 
-      // Do not interrupt the user while they are in login / MFA / password reset flows.
       const inAuthFlow =
         looksLikeLoginUrl(cur) ||
         low.includes("password") ||
@@ -81,6 +88,13 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
         await page.waitForTimeout(5000);
         continue;
       }
+
+      // Avoid hammering Similarweb (can cause 403). Only navigate to the check URL every ~15s.
+      if (Date.now() - lastNavAt < 15_000) {
+        await page.waitForTimeout(3000);
+        continue;
+      }
+      lastNavAt = Date.now();
 
       try {
         const resp = await page.goto(authCheckUrl, { waitUntil: "domcontentloaded" });

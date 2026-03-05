@@ -31,9 +31,18 @@ async function checkSession({ storageStatePath, userDataDir, urlToCheck, headful
     context.setDefaultTimeout(45_000);
 
     const page = await context.newPage();
-    const resp = await page.goto(urlToCheck, { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
-    await page.waitForTimeout(2500);
+    let resp = null;
+    try {
+      resp = await page.goto(urlToCheck, { waitUntil: "domcontentloaded" });
+      await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
+      await page.waitForTimeout(2500).catch(() => {});
+    } catch (err) {
+      const msg = String(err?.message || err || "");
+      if (/target page, context or browser has been closed|target closed/i.test(msg)) {
+        return { ok: false, reason: "target_closed", status: null, finalUrl: null };
+      }
+      throw err;
+    }
 
     const finalUrl = page.url();
     const status = resp ? resp.status() : null;
