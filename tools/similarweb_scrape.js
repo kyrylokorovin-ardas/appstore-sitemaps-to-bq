@@ -136,8 +136,15 @@ function domWaitPatternsForTab(tabName) {
 }
 
 async function fetchDomTextForTab(page, pageUrl, tabName) {
-  await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
+  const resp = await page.goto(pageUrl, { waitUntil: "domcontentloaded" }).catch(() => null);
   await page.waitForTimeout(1200).catch(() => {});
+  const status = resp ? resp.status() : null;
+  if (status != null && status >= 500) {
+    const e = new Error(`Similarweb returned HTTP ${status} for page`);
+    e.code = "SW_HTTP_ERROR";
+    e.httpStatus = status;
+    throw e;
+  }
 
   const hint = await sniffAuthOrBlocked(page);
   if (hint === "login") {
@@ -156,7 +163,15 @@ async function fetchDomTextForTab(page, pageUrl, tabName) {
   }
   await page.waitForTimeout(700).catch(() => {});
   const text = await page.evaluate(() => (document && document.body ? document.body.innerText : ""));
-  return String(text || "");
+  const textStr = String(text || "");
+  if (/internal server error/i.test(textStr)) {
+    const e = new Error("Similarweb page shows Internal Server Error");
+    e.code = "SW_HTTP_ERROR";
+    e.httpStatus = 500;
+    e.bodySnippet = textStr.slice(0, 400);
+    throw e;
+  }
+  return textStr;
 }
 async function writeDomNoDataDebug({ appId, store, tabName, pageUrl, text }) {
   try {
@@ -2444,7 +2459,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
 
 
 
