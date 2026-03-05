@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+﻿import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -81,6 +81,21 @@ function shardBucketForAppId(appId, workers) {
   const first32 = parseInt(hex.slice(0, 8), 16) >>> 0;
   return workers > 0 ? first32 % workers : 0;
 }
+
+async function exportCookiesFromStorageState(storageStatePath, cookiesPath) {
+  try {
+    const raw = await fs.readFile(storageStatePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const cookies = Array.isArray(parsed?.cookies) ? parsed.cookies : null;
+    if (!cookies || cookies.length === 0) return false;
+    await fs.mkdir(path.dirname(cookiesPath), { recursive: true });
+    await fs.writeFile(cookiesPath, JSON.stringify(cookies, null, 2) + "\n", "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 
 let requestBlockingLogged = false;
 const REQUEST_BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
@@ -1658,6 +1673,7 @@ async function main() {
   // Ensure Similarweb session is valid (auto relogin headful if expired).
   const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320?country=999&from=2026-01-01&to=2026-01-31&window=false";
   await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, checkHeadful: headful, userDataDir, storageStatePath, cookiesPath });
+  await exportCookiesFromStorageState(storageStatePath, cookiesPath);
 
   let pw = null;
   try {
@@ -2196,6 +2212,7 @@ async function main() {
         );
 
         await ensureSimilarwebAuth({ urlToCheck: authCheckUrl, headfulOnRelogin: true, checkHeadful: headful, userDataDir, storageStatePath, cookiesPath });
+        await exportCookiesFromStorageState(storageStatePath, cookiesPath);
         if (pw) await pw.close().catch(() => {});
         pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
         http = new SimilarwebHttpClient({ cookiesPath, runLogPath });
