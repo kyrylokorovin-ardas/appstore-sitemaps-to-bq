@@ -587,8 +587,8 @@ async function queryProcessedAlreadyCount({ bq, monthStr, country, tab }) {
   const query = `
     SELECT COUNT(DISTINCT app_id) AS c
     FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
-    WHERE month = @month
-      AND country = @country
+    WHERE month = CAST(@month AS DATE)
+      AND country = CAST(@country AS INT64)
       AND google_package IS NULL
   `;
   const [rows] = await bq.query({ query, params: { month: monthStr, country: countryInt }, types: { month: "DATE", country: "INT64" } });
@@ -633,8 +633,8 @@ async function querySelectionStats({ bq, monthStr, country, tab }) {
       LEFT JOIN (
         SELECT DISTINCT app_id
         FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
-        WHERE month = @month
-          AND country = @country
+        WHERE month = CAST(@month AS DATE)
+          AND country = CAST(@country AS INT64)
           AND google_package IS NULL
       ) t${i} ON t${i}.app_id = c.app_id`
     )
@@ -703,8 +703,8 @@ async function querySelectedAppIds({ bq, mode, limit, monthStr, country, tab }) 
       LEFT JOIN (
         SELECT DISTINCT app_id
         FROM \`${PROJECT_ID}.${DATASET_ID}.${tableId}\`
-        WHERE month = @month
-          AND country = @country
+        WHERE month = CAST(@month AS DATE)
+          AND country = CAST(@country AS INT64)
           AND google_package IS NULL
       ) t${i} ON t${i}.app_id = c.app_id`
     )
@@ -755,7 +755,7 @@ async function querySelectedAppIds({ bq, mode, limit, monthStr, country, tab }) 
 }
 
 async function rowExists(bq, tableId, { monthStr, country, appId, googlePackage }) {
-  const where = ["month = @month", "country = @country", "app_id = @app_id"];
+  const where = ["month = CAST(@month AS DATE)", "country = CAST(@country AS INT64)", "app_id = @app_id"];
   const params = { month: monthStr, country, app_id: appId };
   if (googlePackage != null) {
     where.push("google_package = @google_package");
@@ -787,7 +787,7 @@ function isOverviewEmpty(m) {
 }
 
 async function deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage }) {
-  const where = ["month = @month", "country = @country", "app_id = @app_id"];
+  const where = ["month = CAST(@month AS DATE)", "country = CAST(@country AS INT64)", "app_id = @app_id"];
   const params = { month: monthStr, country, app_id: appId };
   if (googlePackage != null) {
     where.push("google_package = @google_package");
@@ -809,7 +809,7 @@ async function deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, goo
 
 
 async function existingSdkNames(bq, tableId, { monthStr, country, appId, googlePackage }) {
-  const where = ["month = @month", "country = @country", "app_id = @app_id"];
+  const where = ["month = CAST(@month AS DATE)", "country = CAST(@country AS INT64)", "app_id = @app_id"];
   const params = { month: monthStr, country, app_id: appId };
   if (googlePackage != null) {
     where.push("google_package = @google_package");
@@ -1609,6 +1609,7 @@ async function main() {
 
   const limit = mustInt(argv.limit ?? 150, "--limit");
   const country = mustInt(argv.country ?? COUNTRY_DEFAULT, "--country");
+  if (typeof country !== "number") throw new Error("--country must parse to a number (INT64). Got: " + (typeof country));
 
   const workers = mustInt(argv.workers ?? 1, "--workers");
   const worker = mustInt(argv.worker ?? 0, "--worker");
@@ -1627,6 +1628,7 @@ async function main() {
   const fromStr = formatDateUTC(from);
   const toStr = formatDateUTC(to);
 
+  process.stdout.write("Parsed types: typeof country=" + (typeof country) + ", monthDate=" + monthDate.toISOString().slice(0, 10) + "\\n");
   process.stdout.write("BQ params: month=" + monthStr + " (DATE), country=" + country + " (INT64)\\n");
 
 
