@@ -46,6 +46,14 @@ async function checkSession({ storageStatePath, userDataDir, urlToCheck, headful
       return { ok: false, reason: `http_${status}`, status, finalUrl };
     }
 
+    const cookieStr = await page.evaluate(() => document.cookie || "").catch(() => "");
+    const urlOk = finalUrl.includes("/app-analysis/");
+    const cookieOk = String(cookieStr).toLowerCase().includes("auth");
+
+    if (urlOk || cookieOk) {
+      return { ok: true, reason: "ok", status, finalUrl };
+    }
+
     const perfVisible = await page
       .locator("text=Performance Overview")
       .first()

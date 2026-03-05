@@ -37,34 +37,36 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
     const startUrl = url ? String(url) : "https://apps.similarweb.com/";
     await page.goto(startUrl, { waitUntil: "domcontentloaded" });
 
-    const deadline = Date.now() + timeoutMs;
+    const loginDetectDeadline = Date.now() + 90_000;
+    const authCheckUrl = "https://apps.similarweb.com/app-analysis/overview/apple/835599320";
     let authed = false;
-    while (Date.now() < deadline) {
-      const cur = page.url() || "";
-      const looksLikeSimilarweb = cur.startsWith("https://apps.similarweb.com/");
-      const looksLikeLogin = looksLikeLoginUrl(cur);
+    while (Date.now() < loginDetectDeadline) {
+      try {
+        const resp = await page.goto(authCheckUrl, { waitUntil: "domcontentloaded" });
+        await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
+        await page.waitForTimeout(1000);
 
-      const perfVisible = await page
-        .locator("text=Performance Overview")
-        .first()
-        .isVisible({ timeout: 1500 })
-        .catch(() => false);
+        const finalUrl = page.url() || "";
+        const status = resp ? resp.status() : null;
+        const cookieStr = await page.evaluate(() => document.cookie || "").catch(() => "");
 
-      if (looksLikeSimilarweb && !looksLikeLogin && perfVisible) {
-        const cookies = await context.cookies();
-        if (cookies.length > 0) {
+        const urlOk = finalUrl.includes("/app-analysis/");
+        const cookieOk = String(cookieStr).toLowerCase().includes("auth");
+
+        if ((status == null || status < 400) && (urlOk || cookieOk)) {
           authed = true;
           break;
         }
+      } catch {
+        // ignore and retry
       }
 
       await page.waitForTimeout(1000);
     }
 
     if (!authed) {
-      throw new Error(
-        "Timed out waiting for Similarweb login. Finish login and ensure the page shows \"Performance Overview\" (try opening an /app-analysis/overview/... URL)."
-      );
+      process.stdout.write("LOGIN NOT DETECTED – open any app-analysis page\n");
+      throw new Error("Login not detected");
     }
 
     const outStorage = storageStatePath ? String(storageStatePath) : path.join(__dirname, "storageState.json");
