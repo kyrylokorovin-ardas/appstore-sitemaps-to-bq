@@ -230,9 +230,9 @@ async function createReusablePlaywrightPage({ storageStatePath, userDataDir, hea
   let page = null;
 
   if (userDataDir) {
-    context = await chromium.launchPersistentContext(userDataDir, { headless: !headful });
+    context = await chromium.launchPersistentContext(userDataDir, { headless: !headful, channel: "chrome" }).catch(() => chromium.launchPersistentContext(userDataDir, { headless: !headful }));
   } else {
-    browser = await chromium.launch({ headless: !headful });
+    browser = await chromium.launch({ headless: !headful, channel: "chrome" }).catch(() => chromium.launch({ headless: !headful }));
     context = await browser.newContext({ storageState: storageStatePath });
   }
 
@@ -694,9 +694,9 @@ async function resolveGooglePackageViaPlaywright({ appId, country, fromDate, toD
 
   try {
     if (userDataDir) {
-      context = await chromium.launchPersistentContext(userDataDir, { headless: !headful });
+      context = await chromium.launchPersistentContext(userDataDir, { headless: !headful, channel: "chrome" }).catch(() => chromium.launchPersistentContext(userDataDir, { headless: !headful }));
     } else {
-      browser = await chromium.launch({ headless: !headful });
+      browser = await chromium.launch({ headless: !headful, channel: "chrome" }).catch(() => chromium.launch({ headless: !headful }));
       context = await browser.newContext({ storageState: storageStatePath });
     }
 
@@ -1987,6 +1987,12 @@ async function discoverReviewsRouteSegment({ pw, country, fromStr, toStr }) {
   if (!m) return null;
   return m[1];
 }
+async function runDebugAllTabsFlow(args) {
+  const tabs = ["overview", "reviews", "revenue", "audience", "usage_sessions", "technographics"];
+  for (const t of tabs) {
+    await runDebugTabFlow({ ...args, debugTab: t });
+  }
+}
 async function runDebugTabFlow({
   pw,
   storageStatePath,
@@ -2253,7 +2259,7 @@ async function main() {
   if (debugTabFlow) {
     if (!debugAppIdArg) throw new Error("--debug_app_id is required with --debug_tab_flow");
     if (!debugStore || !["apple", "google"].includes(debugStore)) throw new Error("--debug_store must be apple|google when --debug_tab_flow");
-    const dbgTabs = new Set(["overview", "reviews", "usage_sessions", "technographics", "revenue", "audience"]);
+    const dbgTabs = new Set(["overview", "reviews", "usage_sessions", "technographics", "revenue", "audience", "all"]);
     if (!debugTab || !dbgTabs.has(debugTab)) throw new Error("--debug_tab must be one of: overview,reviews,usage_sessions,technographics,revenue,audience when --debug_tab_flow");
   }
 
@@ -2332,7 +2338,7 @@ async function main() {
 
   if (debugTabFlow) {
     const debugAppId = mustInt(debugAppIdArg, "--debug_app_id");
-    await runDebugTabFlow({
+    const args = {
       pw,
       storageStatePath,
       cookiesPath,
@@ -2346,7 +2352,9 @@ async function main() {
       debugTab,
       debugAppId,
       profileDirArg,
-    });
+    };
+    if (debugTab === "all") await runDebugAllTabsFlow(args);
+    else await runDebugTabFlow(args);
     await pw.close();
     return;
   }
@@ -3009,7 +3017,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
 
 
 

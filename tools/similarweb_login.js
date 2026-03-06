@@ -19,8 +19,8 @@ export async function loginAndSaveState({ headful = true, timeoutMinutes = 20, u
   let browser = null;
   let context = null;
   try {
-    browser = userDataDir ? null : await chromium.launch({ headless: !headful });
-    context = userDataDir ? await chromium.launchPersistentContext(String(userDataDir), { headless: !headful }) : await browser.newContext();
+    browser = userDataDir ? null : await chromium.launch({ headless: !headful, channel: "chrome" }).catch(() => chromium.launch({ headless: !headful }));
+    context = userDataDir ? await chromium.launchPersistentContext(String(userDataDir), { headless: !headful, channel: "chrome" }).catch(() => chromium.launchPersistentContext(String(userDataDir), { headless: !headful })) : await browser.newContext();
     const page = await context.newPage();
 
     process.stdout.write(

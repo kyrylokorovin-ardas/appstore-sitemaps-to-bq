@@ -38,9 +38,9 @@ async function fileExists(p) {
 async function checkSession({ storageStatePath, userDataDir, urlToCheck, headful = false }) {
   let browser = null;
   let context = null;
-  browser = userDataDir ? null : await chromium.launch({ headless: !headful });
+  browser = userDataDir ? null : await chromium.launch({ headless: !headful, channel: "chrome" }).catch(() => chromium.launch({ headless: !headful }));
   try {
-    context = userDataDir ? await chromium.launchPersistentContext(userDataDir, { headless: !headful }) : await browser.newContext({ storageState: storageStatePath });
+    context = userDataDir ? await chromium.launchPersistentContext(userDataDir, { headless: !headful, channel: "chrome" }).catch(() => chromium.launchPersistentContext(userDataDir, { headless: !headful })) : await browser.newContext({ storageState: storageStatePath });
     context.setDefaultTimeout(45_000);
 
     const page = await context.newPage();
