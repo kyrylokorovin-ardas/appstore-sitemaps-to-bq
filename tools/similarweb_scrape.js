@@ -2115,7 +2115,7 @@ async function runDebugTabFlow({
   pwResult.expectedVisible = patterns.length ? patterns.some((re) => re.test(bodyText)) : true;
 
   const parserForTab = (t) => {
-    if (safeTab === "overview") return parseOverviewDomPerformanceBlock(t);
+    if (safeTab === "overview") return parseOverviewPerformance(t);
     if (safeTab === "reviews") return parseReviewsReplyRate(t);
     if (safeTab === "usage_sessions") return parseUsageAndSessions(t);
     if (safeTab === "technographics") return parseTechnographicsOverview(t);
