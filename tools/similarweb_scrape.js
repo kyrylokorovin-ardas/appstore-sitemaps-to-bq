@@ -1109,6 +1109,28 @@ async function fetchAndInsert({
           }
 
           let candidateParsed = parser ? parser(candidateText) : {};
+          // If RSC text is only a shell/loading stream, try HTML before DOM.
+          if (!tabParsedHasData(effectiveTab, candidateParsed)) {
+            try {
+              const rHtml2 = await http.fetchHtmlText(candidateUrl, { maxAttempts: 2 });
+              const htmlText2 = rHtml2 && rHtml2.text != null ? String(rHtml2.text) : null;
+              if (htmlText2 != null) {
+                const htmlParsed2 = parser ? parser(htmlText2) : {};
+                if (tabParsedHasData(effectiveTab, htmlParsed2)) {
+                  candidateText = htmlText2;
+                  candidateParsed = htmlParsed2;
+                  if (runLogPath) {
+                    await appendLine(
+                      runLogPath,
+                      JSON.stringify({ event: "html_fallback_shell", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: candidateUrl, query_variant: v.name })
+                    );
+                  }
+                }
+              }
+            } catch (e3) {
+              if (e3 && (e3.code === "SW_LOGIN_EXPIRED" || e3.code === "SW_BLOCKED" || e3.code === "SW_ACCESS_DENIED")) throw e3;
+            }
+          }
 
           // If RSC text is only a shell/loading stream, try DOM.
           if (!tabParsedHasData(effectiveTab, candidateParsed) && pwPage && !candidateUsedDom) {
@@ -1159,6 +1181,27 @@ async function fetchAndInsert({
         const r = await http.fetchRscText(primaryUrl, { maxAttempts: pwPage ? 1 : 3 });
         text = r && r.text != null ? String(r.text) : null;
       } catch (err) {
+        // Try HTML fetch before using Playwright (reduces bot-detection / captcha for bulk runs).
+        try {
+          const rHtml = await http.fetchHtmlText(primaryUrl, { maxAttempts: 2 });
+          const htmlText = rHtml && rHtml.text != null ? String(rHtml.text) : null;
+          if (htmlText != null) {
+            const htmlParsed = parser ? parser(htmlText) : {};
+            if (tabParsedHasData(effectiveTab, htmlParsed)) {
+              text = htmlText;
+              parsed = htmlParsed;
+              usedDomFallback = false;
+              pageUrl = primaryUrl;
+              if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "html_fallback", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: primaryUrl }));
+              // Skip DOM fallback.
+              return { skipped: false, pageUrl: primaryUrl, text, parsed, usedDomFallback: false };
+            }
+          }
+        } catch (e2) {
+          if (e2 && e2.code === "SW_LOGIN_EXPIRED") throw e2;
+          if (e2 && e2.code === "SW_BLOCKED") throw e2;
+          if (e2 && e2.code === "SW_ACCESS_DENIED") throw e2;
+        }
         // Fallback to DOM if HTTP/RSC fails (Similarweb sometimes returns 500 for RSC routes).
         if (pwPage) {
           text = await fetchDomTextForTab(pwPage, primaryUrl, effectiveTab);
@@ -1176,8 +1219,30 @@ async function fetchAndInsert({
       }
 
       parsed = parser ? parser(text) : {};
+          // If RSC text is only a shell/loading stream, try HTML before DOM.
+          if (!tabParsedHasData(effectiveTab, candidateParsed)) {
+            try {
+              const rHtml2 = await http.fetchHtmlText(candidateUrl, { maxAttempts: 2 });
+              const htmlText2 = rHtml2 && rHtml2.text != null ? String(rHtml2.text) : null;
+              if (htmlText2 != null) {
+                const htmlParsed2 = parser ? parser(htmlText2) : {};
+                if (tabParsedHasData(effectiveTab, htmlParsed2)) {
+                  candidateText = htmlText2;
+                  candidateParsed = htmlParsed2;
+                  if (runLogPath) {
+                    await appendLine(
+                      runLogPath,
+                      JSON.stringify({ event: "html_fallback_shell", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: candidateUrl, query_variant: v.name })
+                    );
+                  }
+                }
+              }
+            } catch (e3) {
+              if (e3 && (e3.code === "SW_LOGIN_EXPIRED" || e3.code === "SW_BLOCKED" || e3.code === "SW_ACCESS_DENIED")) throw e3;
+            }
+          }
 
-      // If RSC text is only a shell/loading stream, try DOM.
+          // If RSC text is only a shell/loading stream, try DOM.
       if (!tabParsedHasData(effectiveTab, parsed) && pwPage && !usedDomFallback) {
         const domText = await fetchDomTextForTab(pwPage, primaryUrl, effectiveTab);
         const domParsed = parser ? parser(domText) : {};
@@ -1286,6 +1351,20 @@ async function scrapeTechnographicsSdks({
       if (!pwPage) throw err;
       rawText = null;
       rows = [];
+    }
+
+    // If Similarweb returns an RSC shell/loading stream (no sdkName JSON), try HTML over HTTP before Playwright.
+    if (!rows || !rows.length) {
+      try {
+        const rHtml = await http.fetchHtmlText(pageUrl, { maxAttempts: 2 });
+        rawText = rHtml && rHtml.text != null ? String(rHtml.text) : rawText;
+        rows = parseTechnographicsSdks(rawText);
+        if (rows && rows.length && runLogPath) {
+          await appendLine(runLogPath, JSON.stringify({ event: "html_fallback", at: nowIso(), store, tab: "technographics_sdks", app_id: appId, page_url: pageUrl }));
+        }
+      } catch (eHtml) {
+        if (eHtml && (eHtml.code === "SW_LOGIN_EXPIRED" || eHtml.code === "SW_BLOCKED" || eHtml.code === "SW_ACCESS_DENIED")) throw eHtml;
+      }
     }
 
     // If Similarweb returns an RSC shell/loading stream (no sdkName JSON), fall back to HTML source.
@@ -3128,8 +3207,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
-
 
 
 

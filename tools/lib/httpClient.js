@@ -380,4 +380,128 @@ export class SimilarwebHttpClient {
 
     throw lastErr || new Error("Failed to fetch Similarweb RSC response");
   }
+
+  async fetchHtmlText(url, { maxAttempts = 3 } = {}) {
+    if (!this.cookies) await this.loadCookies();
+
+    let attempt = 0;
+    let lastErr = null;
+    const backoffs = [2000, 5000, 10000];
+
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      await sleep(jitter(800, 1500));
+
+      const fullUrl = String(url);
+      const { header: cookieHeader, cookieCount } = cookiesToHeaderForUrl(this.cookies, fullUrl);
+      if (!cookieHeader) {
+        const err = new Error(`No applicable cookies for ${new URL(fullUrl).hostname}. Re-run node tools/similarweb_login.js to export fresh cookies.`);
+        err.code = "SW_COOKIES_NO_MATCH";
+        throw err;
+      }
+
+      const u = new URL(fullUrl);
+      const origin = u.protocol + "//" + u.host;
+      const referer = fullUrl;
+
+      await appendJsonLine(this.runLogPath, {
+        event: "http_html_attempt",
+        at: new Date().toISOString(),
+        attempt,
+        url: fullUrl,
+        cookie_len: cookieHeader.length,
+        cookie_count: cookieCount,
+      });
+
+      try {
+        const res = await fetch(fullUrl, {
+          method: "GET",
+          redirect: "manual",
+          headers: {
+            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+            origin,
+            referer,
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-dest": "document",
+            "cache-control": "no-cache",
+            pragma: "no-cache",
+            "upgrade-insecure-requests": "1",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            cookie: cookieHeader,
+          },
+        });
+
+        const location = res.headers.get("location") || "";
+        const text = await res.text();
+
+        await appendJsonLine(this.runLogPath, {
+          event: "http_html_response",
+          at: new Date().toISOString(),
+          attempt,
+          url: fullUrl,
+          status: res.status,
+          location: location || null,
+          body_snippet: text ? text.slice(0, 600) : null,
+        });
+
+        if (isLoginRedirect(location, text, res.status)) {
+          const err = new Error("Similarweb session appears expired. Re-run node tools/similarweb_login.js to export fresh cookies.");
+          err.code = "SW_LOGIN_EXPIRED";
+          err.httpStatus = res.status;
+          err.location = location;
+          err.bodySnippet = text ? text.slice(0, 800) : null;
+          throw err;
+        }
+
+        const fatal = classifyFatalAuthIssue(location, text, res.status);
+        if (fatal === "access_denied") {
+          const err = new Error("Similarweb access denied (plan limitation / permission)." );
+          err.code = "SW_ACCESS_DENIED";
+          err.httpStatus = res.status;
+          err.location = location;
+          err.bodySnippet = text ? text.slice(0, 800) : null;
+          throw err;
+        }
+        if (fatal === "blocked") {
+          const err = new Error("Similarweb access blocked (captcha / access denied)." );
+          err.code = "SW_BLOCKED";
+          err.httpStatus = res.status;
+          err.location = location;
+          err.bodySnippet = text ? text.slice(0, 800) : null;
+          throw err;
+        }
+
+        if (res.status === 429 || res.status >= 500) {
+          const err = new Error(`HTTP ${res.status} from Similarweb (retryable)`);
+          err.code = "SW_HTTP_RETRYABLE";
+          err.httpStatus = res.status;
+          err.location = location;
+          err.bodySnippet = text ? text.slice(0, 600) : null;
+          throw err;
+        }
+        if (res.status >= 400) {
+          const err = new Error(`HTTP ${res.status} from Similarweb`);
+          err.code = "SW_HTTP_ERROR";
+          err.httpStatus = res.status;
+          err.location = location;
+          err.bodySnippet = text ? text.slice(0, 600) : null;
+          throw err;
+        }
+
+        return { text };
+      } catch (err) {
+        lastErr = err;
+        if (err && (err.code === "SW_LOGIN_EXPIRED" || err.code === "SW_ACCESS_DENIED" || err.code === "SW_BLOCKED")) throw err;
+
+        if (attempt < maxAttempts) {
+          await sleep(backoffs[Math.min(attempt - 1, backoffs.length - 1)]);
+          continue;
+        }
+      }
+    }
+
+    throw lastErr || new Error("Failed to fetch Similarweb HTML response");
+  }
 }
