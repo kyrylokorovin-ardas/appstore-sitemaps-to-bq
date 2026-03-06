@@ -1935,10 +1935,244 @@ async function scrapeOverviewWithNetwork({
     }
   }
 }
+async function runDebugTabFlow({
+  pw,
+  storageStatePath,
+  cookiesPath,
+  headful,
+  monthDate,
+  monthStr,
+  fromStr,
+  toStr,
+  country,
+  debugStore,
+  debugTab,
+  debugAppId,
+  profileDirArg,
+}) {
+  const logsDir = path.join(__dirname, "..", "logs");
+  await fs.mkdir(logsDir, { recursive: true });
+
+  const safeTab = String(debugTab);
+  const safeStore = String(debugStore);
+  const appIdNum = Number(debugAppId);
+  if (!Number.isFinite(appIdNum) || !Number.isInteger(appIdNum)) throw new Error(`--debug_app_id must be an INT64 app_id for now. Got: ${debugAppId}`);
+
+  const baseName = `debug_${safeTab}_${safeStore}_${appIdNum}`;
+  const logPath = path.join(logsDir, `${baseName}.log`);
+  const htmlPath = path.join(logsDir, `${baseName}.html`);
+  const pngPath = path.join(logsDir, `${baseName}.png`);
+
+  const logLine = async (obj) => {
+    const line = typeof obj === "string" ? obj : JSON.stringify(obj);
+    await appendLine(logPath, line);
+  };
+
+  await logLine({ event: "debug_start", at: nowIso(), tab: safeTab, store: safeStore, app_id: appIdNum, month: monthStr, country, headful, profile_dir: profileDirArg || null });
+
+  const routeId = safeStore === "apple" ? String(appIdNum) : null;
+  let googlePackage = null;
+
+  if (safeStore === "google") {
+    // Try to resolve google package from overview mapping via Playwright (best-effort).
+    const hintUrl = buildSimilarwebUrl(`/app-analysis/overview/apple/${appIdNum}`, { country, from: fromStr, to: toStr, window: "false" });
+    await logLine({ event: "debug_google_pkg_resolve", at: nowIso(), stage: "navigate_apple_overview_for_hint", page_url: hintUrl });
+    await pw.recreatePage();
+    const page = pw.page;
+    const res = await page.goto(hintUrl, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => null);
+    await page.waitForTimeout(1500).catch(() => {});
+    const bodyText = await page.evaluate(() => document.body.innerText || "").catch(() => "");
+    const m = bodyText.match(/\/overview\/google\/([a-zA-Z0-9._-]+)/);
+    if (m) googlePackage = m[1];
+    await logLine({ event: "debug_google_pkg_resolve", at: nowIso(), stage: "hint_extracted", google_package: googlePackage || null, nav_status: res ? res.status() : null, final_url: page.url() });
+    if (!googlePackage) throw new Error("Failed to resolve google package for debug_store=google. Use debug_store=apple or ensure mapping exists.");
+  }
+
+  const tabToRoute = {
+    overview: "overview",
+    reviews: "reviews",
+    usage_sessions: "usage-and-engagement",
+    technographics: "technographics",
+    revenue: "revenue",
+    audience: "audience-analysis",
+  };
+
+  const routeSegment = tabToRoute[safeTab];
+  if (!routeSegment) throw new Error(`Unsupported debug tab: ${safeTab}`);
+
+  const id = safeStore === "apple" ? String(appIdNum) : googlePackage;
+  const route = `/app-analysis/${routeSegment}/${safeStore}/${id}`;
+
+  // Playwright URL: include full date range params for consistency with the UI.
+  const pwUrl = buildSimilarwebUrl(route, { country, from: fromStr, to: toStr, window: "false" });
+
+  // HTTP URL: match production queries.
+  let httpQuery = { country, from: fromStr, to: toStr, window: "false" };
+  if (safeTab === "reviews") httpQuery = { country, window: "false" };
+  const httpUrl = buildSimilarwebUrl(route, httpQuery);
+
+  await logLine({ event: "constructed_urls", at: nowIso(), pw_url: pwUrl, http_url: httpUrl, route, id, google_package: googlePackage || null });
+
+  const page = pw.page;
+
+  // ---- Playwright stage ----
+  const pwResult = {
+    ok: false,
+    status: null,
+    finalUrl: null,
+    title: null,
+    markers: {},
+    expectedVisible: false,
+    parsedHasData: false,
+  };
+
+  await logLine({ event: "pw_goto_start", at: nowIso(), url: pwUrl });
+  let navRes = null;
+  try {
+    navRes = await page.goto(pwUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await page.waitForTimeout(1500);
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+  } catch (err) {
+    await logLine({ event: "pw_goto_error", at: nowIso(), message: String(err?.message || err) });
+  }
+
+  pwResult.status = navRes ? navRes.status() : null;
+  pwResult.finalUrl = page.url();
+  pwResult.title = await page.title().catch(() => null);
+
+  let bodyText = await page.evaluate(() => document.body.innerText || "").catch(() => "");
+  if (bodyText.length > 200_000) bodyText = bodyText.slice(0, 200_000);
+
+  // Simple markers
+  const markers = {
+    internal_server_error: /Internal Server Error/i.test(bodyText),
+    sign_in: /Sign\s*in|Log\s*in|login/i.test(bodyText) || /\/login|\/signin|\/auth/i.test(pwResult.finalUrl || ""),
+    upgrade: /Upgrade|Plan|Subscription/i.test(bodyText),
+    access_denied: /Access\s*Denied|Permission|not\s*available/i.test(bodyText),
+    has_403: /\b403\b/.test(bodyText),
+  };
+  pwResult.markers = markers;
+
+  const patterns = domWaitPatternsForTab(safeTab);
+  pwResult.expectedVisible = patterns.length ? patterns.some((re) => re.test(bodyText)) : true;
+
+  const parserForTab = (t) => {
+    if (safeTab === "overview") return parseOverviewDomPerformanceBlock(t);
+    if (safeTab === "reviews") return parseReviewsReplyRate(t);
+    if (safeTab === "usage_sessions") return parseUsageAndSessions(t);
+    if (safeTab === "technographics") return parseTechnographicsOverview(t);
+    if (safeTab === "revenue") return parseRevenueTotal(t);
+    if (safeTab === "audience") return parseAudience(t);
+    return {};
+  };
+
+  const domParsed = parserForTab(bodyText) || {};
+  pwResult.parsedHasData = tabParsedHasData(safeTab, domParsed);
+  pwResult.ok = Boolean(!markers.sign_in && !markers.internal_server_error && pwResult.expectedVisible);
+
+  await logLine({ event: "pw_goto_done", at: nowIso(), status: pwResult.status, final_url: pwResult.finalUrl, title: pwResult.title, expected_visible: pwResult.expectedVisible, parsed_has_data: pwResult.parsedHasData, markers });
+
+  // Save artifacts
+  try {
+    const html = await page.content();
+    await fs.writeFile(htmlPath, html, { encoding: "utf8" });
+  } catch (err) {
+    await logLine({ event: "artifact_html_error", at: nowIso(), message: String(err?.message || err) });
+  }
+
+  try {
+    await page.screenshot({ path: pngPath, fullPage: true });
+  } catch (err) {
+    await logLine({ event: "artifact_png_error", at: nowIso(), message: String(err?.message || err) });
+  }
+
+  // ---- HTTP stage ----
+  const http = new SimilarwebHttpClient({ cookiesPath, runLogPath: logPath });
+
+  const httpAttemptOnce = async (label, url) => {
+    const r = { label, url, ok: false, status: null, location: null, body_snippet: null, code: null, message: null, parsedHasData: false };
+    try {
+      const res = await http.fetchRscText(url, { maxAttempts: 1 });
+      const text = res && res.text != null ? String(res.text) : "";
+      r.ok = true;
+      r.status = 200;
+      r.body_snippet = text.slice(0, 500);
+      const p = parserForTab(text) || {};
+      r.parsedHasData = tabParsedHasData(safeTab, p);
+      return r;
+    } catch (err) {
+      r.ok = false;
+      r.code = err?.code || null;
+      r.status = err?.httpStatus || null;
+      r.location = err?.location || null;
+      r.body_snippet = err?.bodySnippet ? String(err.bodySnippet).slice(0, 500) : null;
+      r.message = String(err?.message || err).slice(0, 200);
+      return r;
+    }
+  };
+
+  const httpResults = [];
+  httpResults.push(await httpAttemptOnce("primary", httpUrl));
+
+  if (safeTab === "reviews") {
+    // Mirror production variants for reviews.
+    const variants = [
+      { name: "no_country", query: Object.fromEntries(Object.entries(httpQuery).filter(([k]) => k !== "country")) },
+      { name: "us_840", query: { ...httpQuery, country: 840 } },
+      { name: "bare", query: {} },
+      // Also try UI-like from/to for comparison.
+      { name: "from_to", query: { country, from: fromStr, to: toStr, window: "false" } },
+    ];
+    for (const v of variants) {
+      const u = buildSimilarwebUrl(route, v.query);
+      httpResults.push(await httpAttemptOnce(v.name, u));
+    }
+  }
+
+  for (const r of httpResults) {
+    await logLine({ event: "http_debug", at: nowIso(), ...r });
+  }
+
+  const bestHttp = httpResults.find((r) => r.ok && r.parsedHasData) || httpResults.find((r) => r.ok) || httpResults[0];
+
+  const classifyLikelyCause = () => {
+    if (pwResult.markers.sign_in) return "LOGIN_EXPIRED";
+    if (pwResult.markers.upgrade || pwResult.markers.access_denied) return "ACCESS_DENIED";
+    if (pwResult.markers.internal_server_error) return "INTERNAL_SERVER_ERROR";
+
+    if (!pwResult.ok) return "UNKNOWN";
+
+    if (!bestHttp.ok) {
+      if (bestHttp.code === "SW_LOGIN_EXPIRED") return "LOGIN_EXPIRED";
+      if (bestHttp.code === "SW_ACCESS_DENIED") return "ACCESS_DENIED";
+      if (bestHttp.status && bestHttp.status >= 500) return "INTERNAL_SERVER_ERROR";
+      return "UNKNOWN";
+    }
+
+    if (bestHttp.ok && !bestHttp.parsedHasData && pwResult.parsedHasData) return "PARSER_EXPECTATION_MISMATCH";
+    if (bestHttp.ok && !bestHttp.parsedHasData && !pwResult.parsedHasData) return "NO_DATA";
+
+    return "UNKNOWN";
+  };
+
+  const diagnosis = {
+    playwight_page: pwResult.ok ? "PLAYWRIGHT_PAGE_OK" : "PLAYWRIGHT_PAGE_FAIL",
+    http: bestHttp.ok ? "HTTP_OK" : "HTTP_FAIL",
+    likely_cause: classifyLikelyCause(),
+    artifacts: { log: path.relative(path.join(__dirname, ".."), logPath), html: path.relative(path.join(__dirname, ".."), htmlPath), png: path.relative(path.join(__dirname, ".."), pngPath) },
+  };
+
+  await logLine({ event: "diagnosis", at: nowIso(), ...diagnosis });
+
+  process.stdout.write(`Debug artifacts written: ${path.relative(path.join(__dirname, ".."), logPath)}\n`);
+  process.stdout.write(`- HTML: ${path.relative(path.join(__dirname, ".."), htmlPath)}\n`);
+  process.stdout.write(`- PNG: ${path.relative(path.join(__dirname, ".."), pngPath)}\n`);
+  process.stdout.write(`Diagnosis: ${diagnosis.playwight_page}, ${diagnosis.http}, likely=${diagnosis.likely_cause}\n`);
+}
 async function main() {
   const argv = minimist(process.argv.slice(2), {
-    boolean: ["dry_run", "headful", "debug_network"],
-    string: ["month", "mode", "country", "tab", "profile_dir"],
+    boolean: ["dry_run", "headful", "debug_network", "debug_tab_flow"],
+    string: ["month", "mode", "country", "tab", "profile_dir", "debug_app_id", "debug_store", "debug_tab"],
     default: { limit: 150, mode: "backfill", tab: "overview", country: String(COUNTRY_DEFAULT), dry_run: false, headful: false, debug_network: false, workers: 1, worker: 0 },
   });
 
@@ -1960,6 +2194,16 @@ async function main() {
 
   const headful = Boolean(argv.headful);
   const debugNetwork = Boolean(argv.debug_network);
+  const debugTabFlow = Boolean(argv.debug_tab_flow);
+  const debugAppIdArg = argv.debug_app_id != null ? String(argv.debug_app_id) : null;
+  const debugStore = argv.debug_store != null ? String(argv.debug_store) : null;
+  const debugTab = argv.debug_tab != null ? String(argv.debug_tab) : null;
+  if (debugTabFlow) {
+    if (!debugAppIdArg) throw new Error("--debug_app_id is required with --debug_tab_flow");
+    if (!debugStore || !["apple", "google"].includes(debugStore)) throw new Error("--debug_store must be apple|google when --debug_tab_flow");
+    const dbgTabs = new Set(["overview", "reviews", "usage_sessions", "technographics", "revenue", "audience"]);
+    if (!debugTab || !dbgTabs.has(debugTab)) throw new Error("--debug_tab must be one of: overview,reviews,usage_sessions,technographics,revenue,audience when --debug_tab_flow");
+  }
 
   const wantTab = (name) => tab === "all" || tab === name;
   const profileDirArg = argv.profile_dir != null ? String(argv.profile_dir) : null;
@@ -1999,6 +2243,27 @@ async function main() {
     pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
   } catch {
     throw new Error("Missing Similarweb session files. Run `node tools/similarweb_login.js` first (or pass --profile_dir to use a separate session)." );
+  }
+
+  if (debugTabFlow) {
+    const debugAppId = mustInt(debugAppIdArg, "--debug_app_id");
+    await runDebugTabFlow({
+      pw,
+      storageStatePath,
+      cookiesPath,
+      headful: true,
+      monthDate,
+      monthStr,
+      fromStr,
+      toStr,
+      country,
+      debugStore,
+      debugTab,
+      debugAppId,
+      profileDirArg,
+    });
+    await pw.close();
+    return;
   }
 
   const bq = createBigQueryClient();
@@ -2659,8 +2924,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
-
 
 
 
