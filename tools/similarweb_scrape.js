@@ -2198,6 +2198,7 @@ async function main() {
     counters.attempted_apps += 1;
 
     const commonQuery = { country, from: fromStr, to: toStr, window: "false" };
+    const reviewsQuery = { country, window: "false" };
 
     let retrySameApp = false;
 
@@ -2234,7 +2235,7 @@ async function main() {
           tabName: "reviews",
           tableId: TABLES.apple.reviews,
           route: `/app-analysis/reviews/apple/${appId}`,
-          query: commonQuery,
+          query: reviewsQuery,
           appId,
           googlePackage: null,
           parser: (t) => parseReviewsReplyRate(t),
@@ -2319,7 +2320,7 @@ async function main() {
             tabName: "reviews",
             tableId: TABLES.google.reviews,
             route: `/app-analysis/reviews/google/${googlePackage}`,
-            query: commonQuery,
+            query: reviewsQuery,
             appId,
             googlePackage,
             parser: (t) => parseReviewsReplyRate(t),
