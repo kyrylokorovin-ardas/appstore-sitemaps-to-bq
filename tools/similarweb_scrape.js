@@ -1935,6 +1935,46 @@ async function scrapeOverviewWithNetwork({
     }
   }
 }
+async function discoverReviewsRouteSegment({ pw, country, fromStr, toStr }) {
+  // Similarweb sometimes changes the reviews route segment. Discover it once via UI navigation.
+  const page = pw.page;
+  const overviewUrl = buildSimilarwebUrl(`/app-analysis/overview/apple/835599320`, { country, from: fromStr, to: toStr, window: "false" });
+
+  await pw.recreatePage();
+
+  await page.goto(overviewUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
+  await page.waitForTimeout(1200);
+
+  // Try click "Reviews" in the left navigation.
+  const clickReviews = async () => {
+    try {
+      const l = page.getByRole("link", { name: /Reviews/i }).first();
+      if (await l.count()) {
+        await l.click({ timeout: 15_000 });
+        return true;
+      }
+    } catch {}
+
+    try {
+      const l2 = page.locator('a:has-text("Reviews")').first();
+      if (await l2.count()) {
+        await l2.click({ timeout: 15_000 });
+        return true;
+      }
+    } catch {}
+
+    return false;
+  };
+
+  const clicked = await clickReviews();
+  if (!clicked) return null;
+
+  await page.waitForTimeout(1200);
+  const u = page.url();
+  const m = u.match(/\/app-analysis\/([^/]+)\/(apple|google)\//);
+  if (!m) return null;
+  return m[1];
+}
 async function runDebugTabFlow({
   pw,
   storageStatePath,
@@ -2213,6 +2253,7 @@ async function main() {
   const { from, to } = monthRangeUtc(monthDate);
   const fromStr = formatDateUTC(from);
   const toStr = formatDateUTC(to);
+  let reviewsRouteSegment = "reviews";
 
   process.stdout.write("Parsed types: typeof country=" + (typeof country) + ", monthDate=" + monthDate.toISOString().slice(0, 10) + "\\n");
   process.stdout.write("BQ params: month=" + monthStr + " (DATE), country=" + country + " (INT64)\\n");
@@ -2244,6 +2285,20 @@ async function main() {
   } catch {
     throw new Error("Missing Similarweb session files. Run `node tools/similarweb_login.js` first (or pass --profile_dir to use a separate session)." );
   }
+  // Best-effort: discover Similarweb reviews route segment once via UI (Some accounts/routes return 500 on /app-analysis/reviews/*).
+  if (wantTab("reviews")) {
+    try {
+      const discovered = await discoverReviewsRouteSegment({ pw, country, fromStr, toStr });
+      if (discovered) {
+        reviewsRouteSegment = discovered;
+        await appendLine(runLogPath, JSON.stringify({ event: "route_discovered", at: nowIso(), tab: "reviews", segment: discovered }));
+        process.stdout.write(`Discovered reviews route segment: ${discovered}\n`);
+      }
+    } catch (err) {
+      await appendLine(runLogPath, JSON.stringify({ event: "route_discover_failed", at: nowIso(), tab: "reviews", error: String(err?.message || err).slice(0, 200) }));
+    }
+  }
+
 
   if (debugTabFlow) {
     const debugAppId = mustInt(debugAppIdArg, "--debug_app_id");
@@ -2616,7 +2671,7 @@ async function main() {
           store: "apple",
           tabName: "reviews",
           tableId: TABLES.apple.reviews,
-          route: `/app-analysis/reviews/apple/${appId}`,
+          route: `/app-analysis/${reviewsRouteSegment}/apple/${appId}`,
           query: reviewsQuery,
           appId,
           googlePackage: null,
@@ -2701,7 +2756,7 @@ async function main() {
             store: "google",
             tabName: "reviews",
             tableId: TABLES.google.reviews,
-            route: `/app-analysis/reviews/google/${googlePackage}`,
+            route: `/app-analysis/${reviewsRouteSegment}/google/${googlePackage}`,
             query: reviewsQuery,
             appId,
             googlePackage,
@@ -2924,7 +2979,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
 
 
 
