@@ -323,6 +323,7 @@ function isBigQueryInsertError(err) {
 function classifyAuditStatus(err) {
   const code = err && err.code ? String(err.code) : '';
   if (code === 'SW_NO_DATA') return 'NO_DATA';
+  if (code === 'SW_ACCESS_DENIED') return 'ACCESS_DENIED';
   if (code === 'SW_LOGIN_EXPIRED') return 'LOGIN_EXPIRED';
   if (code === 'SW_BLOCKED') return 'CAPTCHA';
   if (code === 'SW_TOO_MANY_429' || code === 'SW_TOO_MANY_403') return 'HTTP_ERROR';
@@ -342,6 +343,13 @@ function truncateDetails(s, maxChars = 800) {
   if (s == null) return null;
   const str = String(s);
   return str.length <= maxChars ? str : str.slice(0, maxChars);
+}
+function computeVerdictForTab(stats) {
+  const s = stats || { success: 0, http_error: 0, access_denied: 0 };
+  if (s.access_denied > 0) return "NOT_READY";
+  if (s.http_error > 0 && s.success === 0) return "NOT_READY";
+  if (s.success > 0) return "READY_FOR_MASS_RUN";
+  return "NOT_READY";
 }
 
 function todayYyyyMmDdUtc() {
@@ -997,6 +1005,24 @@ async function fetchAndInsert({
       const r = await http.fetchRscText(pageUrl, { maxAttempts: pwPage ? 1 : 3 });
       text = r && r.text != null ? String(r.text) : null;
     } catch (err) {
+    if (effectiveTab === "reviews" && runLogPath) {
+      await appendLine(
+        runLogPath,
+        JSON.stringify({
+          event: "reviews_http_fail",
+          at: nowIso(),
+          store,
+          app_id: appId,
+          google_package: googlePackage || null,
+          page_url: pageUrl,
+          code: err?.code || null,
+          httpStatus: err?.httpStatus || null,
+          location: err?.location || null,
+          body_snippet: err?.bodySnippet ? String(err.bodySnippet).slice(0, 300) : null,
+          message: String(err?.message || err).slice(0, 200),
+        })
+      );
+    }
       // Fallback to DOM if HTTP/RSC fails (Similarweb sometimes returns 500 for RSC routes).
       if (pwPage) {
         text = await fetchDomTextForTab(pwPage, pageUrl, effectiveTab);
@@ -1941,7 +1967,9 @@ async function main() {
     captcha: 0,
     bq_error: 0,
     http_error: 0,
+    access_denied: 0,
   };
+  const tabStats = new Map();
 
   const auditTable = bq.dataset(DATASET_ID).table(TABLES.audit);
   const auditBuffer = [];
@@ -1974,8 +2002,19 @@ async function main() {
       else if (status === "NAV_TIMEOUT") counters.nav_timeout += 1;
       else if (status === "BQ_ERROR") counters.bq_error += 1;
       else if (status === "HTTP_ERROR") counters.http_error += 1;
+      else if (status === "ACCESS_DENIED") counters.access_denied += 1;
       else counters.parse_error += 1;
     }
+
+    const key = String(store || "") + ":" + String(tabName || "");
+    const cur = tabStats.get(key) || { success: 0, http_error: 0, access_denied: 0, no_data: 0, other_error: 0 };
+    if (status === "SUCCESS") cur.success += 1;
+    else if (status === "ACCESS_DENIED") cur.access_denied += 1;
+    else if (status === "HTTP_ERROR") cur.http_error += 1;
+    else if (status === "NO_DATA") cur.no_data += 1;
+    else if (status === "SKIPPED_ALREADY_EXISTS") {}
+    else cur.other_error += 1;
+    tabStats.set(key, cur);
 
     await pushAuditRow({
       run_id: runId,
@@ -2482,6 +2521,16 @@ async function main() {
     );
   }
 
+  // Tab readiness verdicts (for mass runs)
+  {
+    const verdicts = {};
+    for (const [k, v] of tabStats.entries()) {
+      verdicts[k] = { ...v, verdict: computeVerdictForTab(v) };
+    }
+    process.stdout.write("Tab verdicts: " + JSON.stringify(verdicts) + String.fromCharCode(10));
+  }
+
+
   await appendLine(runLogPath, JSON.stringify({ event: 'done', at: nowIso(), run_id: runId }));
 
   if (pw) await pw.close().catch(() => {});
@@ -2492,7 +2541,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
 
 
 

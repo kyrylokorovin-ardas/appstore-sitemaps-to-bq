@@ -78,6 +78,10 @@ function classifyFatalAuthIssue({ status, location, text }) {
   if (status >= 300 && status < 400 && location && /login|signin|sign-in|auth/i.test(location)) return "login_expired";
   if (status === 401) return "login_expired";
 
+  const accessDeniedRe = /upgrade|plan|subscription|not included|not available|contact sales|you do not have access|you don\x27t have access|insufficient permissions|requires a paid|feature is not included|permission/i;
+  if ((status === 401 || status === 403) && accessDeniedRe.test(lower)) return "access_denied";
+
+
   const blockRe = /captcha|access denied|unusual traffic|cloudflare|verify you are human|bot detection|blocked/i;
   if ((status === 403 || status === 429) && blockRe.test(lower)) return "blocked";
   if (status >= 400 && blockRe.test(lower)) return "blocked";
@@ -236,6 +240,14 @@ export class SimilarwebHttpClient {
           err.bodySnippet = text ? text.slice(0, 800) : null;
           throw err;
         }
+        if (fatal === "access_denied") {
+          const err = new Error("Similarweb access denied (plan limitation / permission)." );
+          err.code = "SW_ACCESS_DENIED";
+          err.httpStatus = res.status;
+          err.location = location;
+          err.bodySnippet = text ? text.slice(0, 800) : null;
+          throw err;
+        }
         if (fatal === "blocked") {
           const err = new Error("Similarweb access blocked (captcha / access denied). Stop and try again later.");
           err.code = "SW_BLOCKED";
@@ -296,4 +308,3 @@ export class SimilarwebHttpClient {
     throw lastErr || new Error("Failed to fetch Similarweb RSC response");
   }
 }
-
