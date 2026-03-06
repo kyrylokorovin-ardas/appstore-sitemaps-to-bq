@@ -1267,15 +1267,61 @@ async function scrapeTechnographicsSdks({
   googlePackage,
   tableId,
   alertsLogPath,
+  pwPage = null,
+  runLogPath = null,
 }) {
   const route = `/app-analysis/technographics/${store}/${id}`;
   const pageUrl = buildSimilarwebUrl(route, { country, from: fromStr, to: toStr, window: "false" });
 
   try {
-    const { text } = await http.fetchRscText(pageUrl);
-    const rawRsc = truncateForBigQueryString(text);
-    const rows = parseTechnographicsSdks(text);
-    if (!rows.length) return { inserted: 0, pageUrl };
+    let rawText = null;
+    let rows = [];
+
+    try {
+      const r = await http.fetchRscText(pageUrl);
+      rawText = r && r.text != null ? String(r.text) : null;
+      rows = parseTechnographicsSdks(rawText);
+    } catch (err) {
+      // If HTTP fails, we'll try DOM/HTML fallback below.
+      if (!pwPage) throw err;
+      rawText = null;
+      rows = [];
+    }
+
+    // If Similarweb returns an RSC shell/loading stream (no sdkName JSON), fall back to HTML source.
+    if ((!rows || !rows.length) && pwPage) {
+      if (runLogPath) {
+        await appendLine(
+          runLogPath,
+          JSON.stringify({ event: "dom_fallback_html", at: nowIso(), store, tab: "technographics_sdks", app_id: appId, page_url: pageUrl })
+        );
+      }
+
+      const resp = await pwPage.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => null);
+      await pwPage.waitForTimeout(1500).catch(() => {});
+
+      const hint = await sniffAuthOrBlocked(pwPage);
+      if (hint === "login") {
+        const e = new Error("Similarweb session appears expired.");
+        e.code = "SW_LOGIN_EXPIRED";
+        e.httpStatus = resp ? resp.status() : null;
+        throw e;
+      }
+      if (hint === "blocked") {
+        const e = new Error("Similarweb access blocked (captcha / access denied).");
+        e.code = "SW_BLOCKED";
+        e.httpStatus = resp ? resp.status() : null;
+        throw e;
+      }
+
+      const html = await pwPage.content().catch(() => "");
+      rawText = String(html || "");
+      rows = parseTechnographicsSdks(rawText);
+    }
+
+    if (!rows || !rows.length) return { inserted: 0, pageUrl };
+
+    const rawRsc = truncateForBigQueryString(rawText);
 
     const existing = await existingSdkNames(bq, tableId, { monthStr, country, appId, googlePackage });
     const newRows = rows
@@ -1298,9 +1344,16 @@ async function scrapeTechnographicsSdks({
 
     const table = bq.dataset(DATASET_ID).table(tableId);
     await insertRows(table, newRows);
+
+    if (runLogPath) {
+      await appendLine(
+        runLogPath,
+        JSON.stringify({ event: "tab_insert", at: nowIso(), store, tab: "technographics_sdks", table: tableId, rows: newRows.length, app_id: appId, google_package: googlePackage || null })
+      );
+    }
+
     return { inserted: newRows.length, pageUrl };
   } catch (err) {
-
     await insertAlert(
       bq,
       {
@@ -2706,6 +2759,8 @@ async function main() {
         googlePackage,
         tableId: sdksTableId,
         alertsLogPath,
+        pwPage: pw?.page,
+        runLogPath,
       });
 
       await recordAudit({ store, tabName: "technographics", appId, googlePackage, status: "SUCCESS", details: null, pageUrl, durationMs: Date.now() - started, attemptNum });
@@ -3073,8 +3128,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
-
 
 
 
