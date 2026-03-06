@@ -1937,10 +1937,19 @@ async function scrapeOverviewWithNetwork({
 }
 async function discoverReviewsRouteSegment({ pw, country, fromStr, toStr }) {
   // Similarweb sometimes changes the reviews route segment. Discover it once via UI navigation.
-  const page = pw.page;
-  const overviewUrl = buildSimilarwebUrl(`/app-analysis/overview/apple/835599320`, { country, from: fromStr, to: toStr, window: "false" });
+  const overviewUrl = buildSimilarwebUrl(`/app-analysis/overview/apple/835599320`, {
+    country,
+    from: fromStr,
+    to: toStr,
+    window: "false",
+  });
 
-  await pw.recreatePage();
+  let page = pw.page;
+  try {
+    if (page && page.isClosed && page.isClosed()) page = await pw.recreatePage();
+  } catch {
+    page = await pw.recreatePage();
+  }
 
   await page.goto(overviewUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
   await page.waitForTimeout(1200);
@@ -1969,7 +1978,10 @@ async function discoverReviewsRouteSegment({ pw, country, fromStr, toStr }) {
   const clicked = await clickReviews();
   if (!clicked) return null;
 
+  // Wait for URL to become an app-analysis tab URL.
+  await page.waitForURL(/\/app-analysis\//, { timeout: 20_000 }).catch(() => {});
   await page.waitForTimeout(1200);
+
   const u = page.url();
   const m = u.match(/\/app-analysis\/([^/]+)\/(apple|google)\//);
   if (!m) return null;
@@ -2295,7 +2307,25 @@ async function main() {
         process.stdout.write(`Discovered reviews route segment: ${discovered}\n`);
       }
     } catch (err) {
-      await appendLine(runLogPath, JSON.stringify({ event: "route_discover_failed", at: nowIso(), tab: "reviews", error: String(err?.message || err).slice(0, 200) }));
+      const msg = String(err?.message || err);
+      await appendLine(runLogPath, JSON.stringify({ event: "route_discover_failed", at: nowIso(), tab: "reviews", error: msg.slice(0, 200) }));
+      // If the page/context got closed unexpectedly, recreate Playwright session and retry once.
+      if (/has been closed/i.test(msg) || /Target page, context or browser has been closed/i.test(msg)) {
+        try {
+          await pw.close().catch(() => {});
+        } catch {}
+        try {
+          pw = await createReusablePlaywrightPage({ storageStatePath, userDataDir, headful });
+          const discovered2 = await discoverReviewsRouteSegment({ pw, country, fromStr, toStr });
+          if (discovered2) {
+            reviewsRouteSegment = discovered2;
+            await appendLine(runLogPath, JSON.stringify({ event: "route_discovered", at: nowIso(), tab: "reviews", segment: discovered2, retry: true }));
+            process.stdout.write(`Discovered reviews route segment: ${discovered2} (retry)\n`);
+          }
+        } catch (err2) {
+          await appendLine(runLogPath, JSON.stringify({ event: "route_discover_failed_retry", at: nowIso(), tab: "reviews", error: String(err2?.message || err2).slice(0, 200) }));
+        }
+      }
     }
   }
 
@@ -2979,8 +3009,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
-
 
 
 
