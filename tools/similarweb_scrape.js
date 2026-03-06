@@ -1990,7 +1990,11 @@ async function discoverReviewsRouteSegment({ pw, country, fromStr, toStr }) {
 async function runDebugAllTabsFlow(args) {
   const tabs = ["overview", "reviews", "revenue", "audience", "usage_sessions", "technographics"];
   for (const t of tabs) {
-    await runDebugTabFlow({ ...args, debugTab: t });
+    try {
+      await runDebugTabFlow({ ...args, debugTab: t });
+    } catch (err) {
+      process.stderr.write(`debug_tab_flow failed for tab=${t}: ${String(err?.message || err)}\n`);
+    }
   }
 }
 async function runDebugTabFlow({
@@ -2673,7 +2677,7 @@ async function main() {
     counters.attempted_apps += 1;
 
     const commonQuery = { country, from: fromStr, to: toStr, window: "false" };
-    const reviewsQuery = { country, window: "false" };
+    const reviewsQuery = { country, from: fromStr, to: toStr, window: "false" };
 
     let retrySameApp = false;
 
@@ -3017,7 +3021,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
 
 
 
