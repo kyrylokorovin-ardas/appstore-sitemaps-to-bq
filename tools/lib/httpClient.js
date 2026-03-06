@@ -258,6 +258,12 @@ export class SimilarwebHttpClient {
         }
 
         if (res.status === 429 || res.status >= 500) {
+          const err = new Error(`HTTP ${res.status} from Similarweb (retryable)`);
+          err.code = "SW_HTTP_RETRYABLE";
+          err.httpStatus = res.status;
+          err.location = location;
+          err.bodySnippet = text ? text.slice(0, 800) : null;
+          lastErr = err;
           const backoffMs = backoffs[Math.min(attempt - 1, backoffs.length - 1)];
           await sleep(backoffMs);
           continue;
