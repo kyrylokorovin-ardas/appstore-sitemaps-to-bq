@@ -13,6 +13,19 @@ function randomRscToken() {
   return crypto.randomBytes(6).toString("hex");
 }
 
+function addLangPrefixToUrl(rawUrl, lang = "en") {
+  try {
+    const u = new URL(rawUrl);
+    const p = u.pathname || "";
+    if (!u.hostname.includes("similarweb.com")) return null;
+    if (!p.startsWith("/app-analysis/")) return null;
+    if (p.startsWith(`/${lang}/app-analysis/`)) return null;
+    u.pathname = `/${lang}` + p;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
 async function appendJsonLine(logPath, obj) {
   if (!logPath) return;
   try {
@@ -145,6 +158,7 @@ export class SimilarwebHttpClient {
     let lastErr = null;
     const backoffs = [2000, 5000, 10000];
 
+    const altBaseUrl = addLangPrefixToUrl(url, "en");
     while (attempt < maxAttempts) {
       attempt += 1;
 
@@ -209,6 +223,59 @@ export class SimilarwebHttpClient {
           location: location || null,
           body_snippet: text ? text.slice(0, 600) : null,
         });
+         // If Similarweb returns 5xx for non-lang URL, try the /en/ route once.
+         if ((res.status >= 500 || res.status === 429) && altBaseUrl && !fullUrl.includes("/en/app-analysis/")) {
+           const altFullUrl = altBaseUrl.includes("&_rsc=") || altBaseUrl.includes("?_rsc=")
+             ? altBaseUrl
+             : `${altBaseUrl}${altBaseUrl.includes("?") ? "&" : "?"}_rsc=${randomRscToken()}`;
+
+           await appendJsonLine(this.runLogPath, {
+             event: "http_rsc_alt_lang_retry",
+             at: new Date().toISOString(),
+             attempt,
+             url: altFullUrl,
+             reason_status: res.status,
+           });
+
+           const altRes = await fetch(altFullUrl, {
+             method: "GET",
+             redirect: "manual",
+             headers: {
+               accept: "text/x-component",
+               rsc: "1",
+               "accept-language": "en-US,en;q=0.9",
+               origin,
+               referer: altFullUrl.replace(/([?&])_rsc=[^&]+/, "").replace(/[?&]$/, ""),
+               "sec-fetch-site": "same-origin",
+               "sec-fetch-mode": "cors",
+               "sec-fetch-dest": "empty",
+               "cache-control": "no-cache",
+               pragma: "no-cache",
+               "user-agent":
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+               cookie: cookieHeader,
+             },
+           });
+
+           const altLocation = altRes.headers.get("location") || "";
+           const altText = await altRes.text();
+
+           await appendJsonLine(this.runLogPath, {
+             event: "http_rsc_alt_lang_response",
+             at: new Date().toISOString(),
+             attempt,
+             url: altFullUrl,
+             status: altRes.status,
+             location: altLocation || null,
+             body_snippet: altText ? altText.slice(0, 600) : null,
+           });
+
+           if (altRes.ok) {
+             this.consecutive429 = 0;
+             this.consecutive403 = 0;
+             return { url: altFullUrl, status: altRes.status, text: altText };
+           }
+         }
 
         if (res.status === 429) this.consecutive429 += 1;
         else this.consecutive429 = 0;

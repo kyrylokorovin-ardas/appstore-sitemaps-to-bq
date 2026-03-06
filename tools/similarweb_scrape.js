@@ -993,74 +993,175 @@ async function fetchAndInsert({
   pwPage = null,
   domTabName = null,
 }) {
-  const pageUrl = buildSimilarwebUrl(route, query);
+  const primaryUrl = buildSimilarwebUrl(route, query);
   const effectiveTab = domTabName || tab;
 
   let text = null;
   let parsed = {};
   let usedDomFallback = false;
+  let pageUrl = primaryUrl;
+  let queryVariant = null;
 
   try {
-    try {
-      const r = await http.fetchRscText(pageUrl, { maxAttempts: pwPage ? 1 : 3 });
-      text = r && r.text != null ? String(r.text) : null;
-    } catch (err) {
-    if (effectiveTab === "reviews" && runLogPath) {
-      await appendLine(
-        runLogPath,
-        JSON.stringify({
-          event: "reviews_http_fail",
-          at: nowIso(),
-          store,
-          app_id: appId,
-          google_package: googlePackage || null,
-          page_url: pageUrl,
-          code: err?.code || null,
-          httpStatus: err?.httpStatus || null,
-          location: err?.location || null,
-          body_snippet: err?.bodySnippet ? String(err.bodySnippet).slice(0, 300) : null,
-          message: String(err?.message || err).slice(0, 200),
-        })
-      );
-    }
-      // Fallback to DOM if HTTP/RSC fails (Similarweb sometimes returns 500 for RSC routes).
-      if (pwPage) {
-        text = await fetchDomTextForTab(pwPage, pageUrl, effectiveTab);
-        usedDomFallback = true;
-        if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_fallback", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: pageUrl, reason: err?.code || err?.httpStatus || "http_error" }));
-      } else {
-        throw err;
+    if (effectiveTab === "reviews") {
+      const variants = [
+        { name: "primary", query },
+        { name: "no_country", query: Object.fromEntries(Object.entries(query).filter(([k]) => k !== "country")) },
+        { name: "us_840", query: { ...query, country: 840 } },
+        { name: "bare", query: {} },
+      ];
+
+      let lastErr = null;
+      for (const v of variants) {
+        const candidateUrl = buildSimilarwebUrl(route, v.query);
+        try {
+          let candidateText = null;
+          let candidateUsedDom = false;
+
+          try {
+            const r = await http.fetchRscText(candidateUrl, { maxAttempts: pwPage ? 1 : 3 });
+            candidateText = r && r.text != null ? String(r.text) : null;
+          } catch (err) {
+            if (runLogPath) {
+              await appendLine(
+                runLogPath,
+                JSON.stringify({
+                  event: "reviews_http_fail",
+                  at: nowIso(),
+                  store,
+                  app_id: appId,
+                  google_package: googlePackage || null,
+                  page_url: candidateUrl,
+                  query_variant: v.name,
+                  code: err?.code || null,
+                  httpStatus: err?.httpStatus || null,
+                  location: err?.location || null,
+                  body_snippet: err?.bodySnippet ? String(err.bodySnippet).slice(0, 300) : null,
+                  message: String(err?.message || err).slice(0, 200),
+                })
+              );
+            }
+
+            // Fallback to DOM for this variant.
+            if (pwPage) {
+              candidateText = await fetchDomTextForTab(pwPage, candidateUrl, effectiveTab);
+              candidateUsedDom = true;
+              if (runLogPath) {
+                await appendLine(
+                  runLogPath,
+                  JSON.stringify({
+                    event: "dom_fallback",
+                    at: nowIso(),
+                    store,
+                    tab: effectiveTab,
+                    app_id: appId,
+                    page_url: candidateUrl,
+                    reason: err?.code || err?.httpStatus || "http_error",
+                    query_variant: v.name,
+                  })
+                );
+              }
+            } else {
+              throw err;
+            }
+          }
+
+          if (candidateText == null) {
+            const e = new Error("No response text");
+            e.code = "SW_NO_DATA";
+            throw e;
+          }
+
+          let candidateParsed = parser ? parser(candidateText) : {};
+
+          // If RSC text is only a shell/loading stream, try DOM.
+          if (!tabParsedHasData(effectiveTab, candidateParsed) && pwPage && !candidateUsedDom) {
+            const domText = await fetchDomTextForTab(pwPage, candidateUrl, effectiveTab);
+            const domParsed = parser ? parser(domText) : {};
+            if (tabParsedHasData(effectiveTab, domParsed)) {
+              candidateText = domText;
+              candidateParsed = domParsed;
+              candidateUsedDom = true;
+              if (runLogPath) {
+                await appendLine(
+                  runLogPath,
+                  JSON.stringify({ event: "dom_fallback_shell", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: candidateUrl, query_variant: v.name })
+                );
+              }
+            }
+          }
+
+          if (tabParsedHasData(effectiveTab, candidateParsed)) {
+            text = candidateText;
+            parsed = candidateParsed;
+            usedDomFallback = candidateUsedDom;
+            pageUrl = candidateUrl;
+            queryVariant = v.name;
+            lastErr = null;
+            break;
+          }
+
+          // Try next variant.
+          lastErr = null;
+        } catch (err) {
+          lastErr = err;
+        }
       }
-    }
 
-    if (text == null) {
-      const e = new Error("No response text");
-      e.code = "SW_NO_DATA";
-      throw e;
-    }
-
-    parsed = parser ? parser(text) : {};
-
-    // If RSC text is only a shell/loading stream, try DOM.
-    if (!tabParsedHasData(effectiveTab, parsed) && pwPage && !usedDomFallback) {
-      const domText = await fetchDomTextForTab(pwPage, pageUrl, effectiveTab);
-      const domParsed = parser ? parser(domText) : {};
-      if (tabParsedHasData(effectiveTab, domParsed)) {
-        text = domText;
-        parsed = domParsed;
-        usedDomFallback = true;
-        if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_fallback_shell", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: pageUrl }));
+      if (text == null) {
+        if (lastErr) throw lastErr;
+        const e = new Error("No parsable data for tab");
+        e.code = "SW_NO_DATA";
+        if (pwPage) {
+          const dbg = await writeDomNoDataDebug({ appId, store, tabName: effectiveTab, pageUrl, text });
+          if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_no_data", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: pageUrl, debug_file: dbg }));
+        }
+        throw e;
       }
-    }
-
-    if (!tabParsedHasData(effectiveTab, parsed)) {
-      const e = new Error("No parsable data for tab");
-      e.code = "SW_NO_DATA";
-      if (pwPage) {
-        const dbg = await writeDomNoDataDebug({ appId, store, tabName: effectiveTab, pageUrl, text });
-        if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_no_data", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: pageUrl, debug_file: dbg }));
+    } else {
+      try {
+        const r = await http.fetchRscText(primaryUrl, { maxAttempts: pwPage ? 1 : 3 });
+        text = r && r.text != null ? String(r.text) : null;
+      } catch (err) {
+        // Fallback to DOM if HTTP/RSC fails (Similarweb sometimes returns 500 for RSC routes).
+        if (pwPage) {
+          text = await fetchDomTextForTab(pwPage, primaryUrl, effectiveTab);
+          usedDomFallback = true;
+          if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_fallback", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: primaryUrl, reason: err?.code || err?.httpStatus || "http_error" }));
+        } else {
+          throw err;
+        }
       }
-      throw e;
+
+      if (text == null) {
+        const e = new Error("No response text");
+        e.code = "SW_NO_DATA";
+        throw e;
+      }
+
+      parsed = parser ? parser(text) : {};
+
+      // If RSC text is only a shell/loading stream, try DOM.
+      if (!tabParsedHasData(effectiveTab, parsed) && pwPage && !usedDomFallback) {
+        const domText = await fetchDomTextForTab(pwPage, primaryUrl, effectiveTab);
+        const domParsed = parser ? parser(domText) : {};
+        if (tabParsedHasData(effectiveTab, domParsed)) {
+          text = domText;
+          parsed = domParsed;
+          usedDomFallback = true;
+          if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_fallback_shell", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: primaryUrl }));
+        }
+      }
+
+      if (!tabParsedHasData(effectiveTab, parsed)) {
+        const e = new Error("No parsable data for tab");
+        e.code = "SW_NO_DATA";
+        if (pwPage) {
+          const dbg = await writeDomNoDataDebug({ appId, store, tabName: effectiveTab, pageUrl: primaryUrl, text });
+          if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "dom_no_data", at: nowIso(), store, tab: effectiveTab, app_id: appId, page_url: primaryUrl, debug_file: dbg }));
+        }
+        throw e;
+      }
     }
 
     const rawRsc = truncateForBigQueryString(text);
@@ -1078,7 +1179,23 @@ async function fetchAndInsert({
     const table = bq.dataset(DATASET_ID).table(tableId);
     await deleteSingleRowByKey(bq, tableId, { monthStr, country, appId, googlePackage });
     await insertRows(table, [row]);
-    if (runLogPath) await appendLine(runLogPath, JSON.stringify({ event: "tab_insert", at: nowIso(), store, tab: effectiveTab, table: tableId, rows: 1, app_id: appId, google_package: googlePackage || null, dom_fallback: usedDomFallback }));
+    if (runLogPath) {
+      await appendLine(
+        runLogPath,
+        JSON.stringify({
+          event: "tab_insert",
+          at: nowIso(),
+          store,
+          tab: effectiveTab,
+          table: tableId,
+          rows: 1,
+          app_id: appId,
+          google_package: googlePackage || null,
+          dom_fallback: usedDomFallback,
+          query_variant: queryVariant,
+        })
+      );
+    }
 
     return { skipped: false, pageUrl, text, parsed, usedDomFallback };
   } catch (err) {
@@ -2542,7 +2659,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
 
 
 
