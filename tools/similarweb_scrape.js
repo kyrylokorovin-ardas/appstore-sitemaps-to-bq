@@ -63,16 +63,52 @@ function isPlaywrightTimeout(err) {
 }
 
 async function sniffAuthOrBlocked(page) {
+  let url = "";
   try {
-    const u = String(page?.url?.() || "");
-    if (/\/login|signin|sign-in|\/auth/i.test(u)) return "login";
-  } catch {}
+    url = String(page?.url?.() || "");
+  } catch {
+    url = "";
+  }
+
+  const urlLow = url.toLowerCase();
+  if (/secure\.similarweb\.com/.test(urlLow) && (/\/account\/login|\/login|signin|sign-in|\/auth/i.test(urlLow))) return "login";
+  if (/\/login|signin|sign-in|\/auth/i.test(urlLow)) return "login";
+
   try {
-    const t = await page.evaluate(() => (document && document.body ? document.body.innerText : ""));
-    const low = String(t || "").toLowerCase();
+    const res = await page.evaluate(() => {
+      const text = document && document.body ? document.body.innerText || "" : "";
+      const low = String(text || "").toLowerCase();
+
+      const hasPassword = Boolean(
+        document.querySelector('input[type="password"], input[name*="password" i], input[id*="password" i]')
+      );
+      const hasEmail = Boolean(document.querySelector('input[type="email"], input[name*="email" i], input[id*="email" i]'));
+      const hasOtp = Boolean(
+        document.querySelector(
+          'input[autocomplete="one-time-code"], input[name*="code" i], input[id*="code" i], input[name*="otp" i], input[id*="otp" i]'
+        )
+      );
+
+      // Heuristic: a login/verification page usually has password or OTP fields.
+      const hasAuthForm = hasPassword || hasOtp;
+
+      return {
+        low: low.slice(0, 20000),
+        hasPassword,
+        hasEmail,
+        hasOtp,
+        hasAuthForm,
+      };
+    });
+
+    const low = String(res?.low || "");
     if (low.includes("access denied") || low.includes("captcha") || low.includes("verify you are human")) return "blocked";
-    if (low.includes("sign in") || low.includes("log in") || low.includes("login")) return "login";
-  } catch {}
+
+    if (res?.hasAuthForm) return "login";
+  } catch {
+    // ignore
+  }
+
   return "unknown";
 }
 
@@ -2105,10 +2141,26 @@ async function runDebugTabFlow({
   let bodyText = await page.evaluate(() => document.body.innerText || "").catch(() => "");
   if (bodyText.length > 200_000) bodyText = bodyText.slice(0, 200_000);
 
+  const loginSignals = await page
+    .evaluate(() => {
+      const hasPassword = Boolean(
+        document.querySelector('input[type="password"], input[name*="password" i], input[id*="password" i]')
+      );
+      const hasEmail = Boolean(document.querySelector('input[type="email"], input[name*="email" i], input[id*="email" i]'));
+      const hasOtp = Boolean(
+        document.querySelector(
+          'input[autocomplete="one-time-code"], input[name*="code" i], input[id*="code" i], input[name*="otp" i], input[id*="otp" i]'
+        )
+      );
+      const hasAuthForm = hasPassword || hasOtp;
+      return { hasPassword, hasEmail, hasOtp, hasAuthForm };
+    })
+    .catch(() => ({ hasPassword: false, hasEmail: false, hasOtp: false, hasAuthForm: false }));
+
   // Simple markers
   const markers = {
     internal_server_error: /Internal Server Error/i.test(bodyText),
-    sign_in: /Sign\s*in|Log\s*in|login/i.test(bodyText) || /\/login|\/signin|\/auth/i.test(pwResult.finalUrl || ""),
+    sign_in: Boolean(loginSignals && loginSignals.hasAuthForm) || /secure\.similarweb\.com\/account\/login|\/login|\/signin|\/auth/i.test(pwResult.finalUrl || ""),
     upgrade: /Upgrade|Plan|Subscription/i.test(bodyText),
     access_denied: /Access\s*Denied|Permission|not\s*available/i.test(bodyText),
     has_403: /\b403\b/.test(bodyText),
@@ -3021,8 +3073,6 @@ main().catch((err) => {
 `);
   process.exitCode = 1;
 });
-
-
 
 
 
