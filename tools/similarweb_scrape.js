@@ -2117,7 +2117,7 @@ async function runDebugTabFlow({
   const parserForTab = (t) => {
     if (safeTab === "overview") return parseOverviewPerformance(t);
     if (safeTab === "reviews") return parseReviewsReplyRate(t);
-    if (safeTab === "usage_sessions") return parseUsageAndSessions(t);
+    if (safeTab === "usage_sessions") return parseUsageSessions(t);
     if (safeTab === "technographics") return parseTechnographicsOverview(t);
     if (safeTab === "revenue") return parseRevenueTotal(t);
     if (safeTab === "audience") return parseAudience(t);
