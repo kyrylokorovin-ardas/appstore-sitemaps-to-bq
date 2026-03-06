@@ -85,21 +85,33 @@ function cookiesToHeaderForUrl(cookies, url) {
   return { header, cookieCount: selected.length };
 }
 
+function isLikelyLoginHtml(text) {
+  const t = String(text || "");
+  const low = t.toLowerCase();
+  if (low.includes("secure.similarweb.com/account/login")) return true;
+  if (low.includes("/account/login") && low.includes("returnurl")) return true;
+  if (/<input[^>]+type=["\x27]password["\x27]/i.test(t)) return true;
+  if (/autocomplete=["\x27](current-password|one-time-code)["\x27]/i.test(t)) return true;
+  if (/<title>\s*(login|sign in)[^<]*<\/title>/i.test(t)) return true;
+  if (/sign\s*in\s*to\s*similarweb/i.test(low)) return true;
+  return false;
+}
+
 function classifyFatalAuthIssue({ status, location, text }) {
-  const lower = (text || "").toLowerCase();
+  const lower = String(text || "").toLowerCase();
+  const loc = String(location || "");
 
-  if (status >= 300 && status < 400 && location && /login|signin|sign-in|auth/i.test(location)) return "login_expired";
+  if (status >= 300 && status < 400 && loc && /secure\.similarweb\.com\/account\/login|\/login|signin|sign-in|\/auth/i.test(loc)) return "login_expired";
   if (status === 401) return "login_expired";
+  if (status === 200 && isLikelyLoginHtml(text)) return "login_expired";
 
-  const accessDeniedRe = /upgrade|plan|subscription|not included|not available|contact sales|you do not have access|you don\x27t have access|insufficient permissions|requires a paid|feature is not included|permission/i;
+  const accessDeniedRe = /upgrade|plan|subscription|not included|not available|contact sales|you do not have access|you don\\x27t have access|insufficient permissions|requires a paid|feature is not included|permission/i;
   if ((status === 401 || status === 403) && accessDeniedRe.test(lower)) return "access_denied";
-
 
   const blockRe = /captcha|access denied|unusual traffic|cloudflare|verify you are human|bot detection|blocked/i;
   if ((status === 403 || status === 429) && blockRe.test(lower)) return "blocked";
   if (status >= 400 && blockRe.test(lower)) return "blocked";
-
-  if (/sign in|log in|login/.test(lower) && /password|email|continue/.test(lower)) return "login_expired";
+  if (status === 200 && (lower.includes("verify you are human") || lower.includes("captcha"))) return "blocked";
 
   return null;
 }
@@ -446,7 +458,9 @@ export class SimilarwebHttpClient {
           body_snippet: text ? text.slice(0, 600) : null,
         });
 
-        if (isLoginRedirect(location, text, res.status)) {
+
+        const fatal = classifyFatalAuthIssue({ status: res.status, location, text });
+        if (fatal === "login_expired") {
           const err = new Error("Similarweb session appears expired. Re-run node tools/similarweb_login.js to export fresh cookies.");
           err.code = "SW_LOGIN_EXPIRED";
           err.httpStatus = res.status;
@@ -454,8 +468,6 @@ export class SimilarwebHttpClient {
           err.bodySnippet = text ? text.slice(0, 800) : null;
           throw err;
         }
-
-        const fatal = classifyFatalAuthIssue(location, text, res.status);
         if (fatal === "access_denied") {
           const err = new Error("Similarweb access denied (plan limitation / permission)." );
           err.code = "SW_ACCESS_DENIED";
