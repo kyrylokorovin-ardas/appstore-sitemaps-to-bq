@@ -218,13 +218,23 @@ function buildCapture() {
 
     const isDoc = rt === "document";
     const isX = rt === "xhr" || rt === "fetch";
+    const isWs = rt === "websocket";
+
+    const isOtherMaybeData =
+      rt === "other" &&
+      isProbablyUsefulHost(host) &&
+      (url.toLowerCase().includes("app-analysis") ||
+        url.toLowerCase().includes("graphql") ||
+        url.toLowerCase().includes("/api/") ||
+        url.toLowerCase().includes("_rsc=") ||
+        url.toLowerCase().includes("_next/data"));
 
     const isScriptMaybeData =
       rt === "script" &&
       isProbablyUsefulHost(host) &&
       (url.includes("_next/data") || url.toLowerCase().includes("graphql") || url.toLowerCase().includes("/api/") || url.toLowerCase().endsWith(".json"));
 
-    if (!isDoc && !isX && !isScriptMaybeData) return;
+    if (!isDoc && !isX && !isWs && !isOtherMaybeData && !isScriptMaybeData) return;
 
     if (isTrackerUrl(url) && !String(host || "").toLowerCase().endsWith("similarweb.com")) return;
 
@@ -239,6 +249,15 @@ function buildCapture() {
       method,
       resource_type: rt,
       request_headers: requestHeaderSubset(h),
+      postDataSnippet: (() => {
+        try {
+          const pd = req.postData();
+          if (!pd) return null;
+          return pd.length > 2000 ? pd.slice(0, 2000) : pd;
+        } catch {
+          return null;
+        }
+      })(),
       started_at: new Date().toISOString(),
       status: null,
       response_content_type: null,
@@ -539,6 +558,7 @@ main().catch((err) => {
   process.stderr.write(String(err && err.stack ? err.stack : err) + "\n");
   process.exit(1);
 });
+
 
 
 
