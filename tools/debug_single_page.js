@@ -1,5 +1,6 @@
 ﻿import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import minimist from "minimist";
 import { chromium } from "playwright";
@@ -21,592 +22,453 @@ function nowStampUtc() {
   );
 }
 
-function safeStringify(v, maxChars = null) {
+function safeStringify(v, space = 2) {
   try {
-    const s = JSON.stringify(v);
-    if (maxChars != null && s.length > maxChars) return s.slice(0, maxChars);
-    return s;
+    return JSON.stringify(v, null, space);
   } catch {
     return null;
   }
 }
 
-function isPlainObject(x) {
-  return x != null && typeof x === "object" && !Array.isArray(x);
+function monthToRange(monthStr) {
+  const m = String(monthStr || "").trim();
+  if (!/^\d{4}-\d{2}$/.test(m)) throw new Error(`Invalid --month=${monthStr}; expected YYYY-MM`);
+  const [y, mo] = m.split("-").map((x) => Number(x));
+  const from = new Date(Date.UTC(y, mo - 1, 1));
+  const to = new Date(Date.UTC(y, mo, 0));
+  const iso = (dt) => dt.toISOString().slice(0, 10);
+  return { from: iso(from), to: iso(to) };
 }
 
-function* walkJson(obj, { maxNodes = 30000 } = {}) {
-  const stack = [{ value: obj, path: "$" }];
-  let nodes = 0;
-  while (stack.length) {
-    const { value, path: p } = stack.pop();
-    nodes += 1;
-    if (nodes > maxNodes) return;
-
-    yield { value, path: p };
-
-    if (Array.isArray(value)) {
-      for (let i = value.length - 1; i >= 0; i--) {
-        stack.push({ value: value[i], path: `${p}[${i}]` });
-      }
-      continue;
-    }
-    if (!isPlainObject(value)) continue;
-
-    const entries = Object.entries(value);
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const [k, v] = entries[i];
-      const nextPath = `${p}.${k}`;
-      stack.push({ value: v, path: nextPath });
-    }
-  }
+function buildTabUrl({ tab, store, id, country, from, to }) {
+  const tabToRoute = {
+    overview: "overview",
+    usage_sessions: "usage-and-engagement",
+    reviews: "reviews",
+    revenue: "revenue",
+    audience: "audience-analysis",
+    technographics: "technographics",
+  };
+  const route = tabToRoute[tab];
+  if (!route) throw new Error(`Unknown tab=${tab}`);
+  const base = `https://apps.similarweb.com/app-analysis/${route}/${store}/${id}`;
+  const u = new URL(base);
+  u.searchParams.set("country", String(country));
+  u.searchParams.set("from", from);
+  u.searchParams.set("to", to);
+  u.searchParams.set("window", "false");
+  return u.toString();
 }
 
-function findKeyPaths(obj, wantedKeysLower) {
-  const out = [];
-  for (const { value, path: p } of walkJson(obj)) {
-    if (!isPlainObject(value)) continue;
-    for (const [k, v] of Object.entries(value)) {
-      const lk = String(k).toLowerCase();
-      if (!wantedKeysLower.has(lk)) continue;
-      out.push({ key: lk, path: `${p}.${k}`, value: v });
-    }
-  }
-  return out;
+function isProbablyUsefulHost(host) {
+  const h = String(host || "").toLowerCase();
+  return Boolean(h) && h.endsWith("similarweb.com");
 }
 
-function normalizeNumberText(s) {
-  if (s == null) return null;
-  if (typeof s === "number" && Number.isFinite(s)) return s;
-  const raw = String(s).trim();
-  if (!raw || raw === "-" || /^n\/a$/i.test(raw)) return null;
-  const cleaned = raw.replace(/,/g, "").replace(/\s+/g, " ").trim();
-  const m = cleaned.match(/^(-?\d+(?:\.\d+)?)([KMB])?$/i);
-  if (m) {
-    const n = Number(m[1]);
-    if (!Number.isFinite(n)) return null;
-    const suf = (m[2] || "").toUpperCase();
-    const mult = suf === "K" ? 1e3 : suf === "M" ? 1e6 : suf === "B" ? 1e9 : 1;
-    return n * mult;
-  }
-  const n2 = Number(cleaned);
-  return Number.isFinite(n2) ? n2 : null;
-}
-
-function normalizeCurrencyUsd(s) {
-  if (s == null) return { usd: null, text: null };
-  if (typeof s === "number" && Number.isFinite(s)) return { usd: s, text: String(s) };
-  const text = String(s).trim();
-  if (!text || text === "-" || /^n\/a$/i.test(text)) return { usd: null, text: text || null };
-  const cleaned = text.replace(/,/g, "").replace(/\$/g, "").trim();
-  const m = cleaned.match(/^(-?\d+(?:\.\d+)?)([KMB])?$/i);
-  if (m) {
-    const base = Number(m[1]);
-    if (!Number.isFinite(base)) return { usd: null, text };
-    const suf = (m[2] || "").toUpperCase();
-    const mult = suf === "K" ? 1e3 : suf === "M" ? 1e6 : suf === "B" ? 1e9 : 1;
-    return { usd: base * mult, text };
-  }
-  const n = Number(cleaned);
-  return { usd: Number.isFinite(n) ? n : null, text };
-}
-
-function pickMetricFromHits(hits, { kind, min = null, max = null } = {}) {
-  for (const h of hits) {
-    const v = h.value;
-    let n = null;
-    if (kind === "currency") {
-      if (typeof v === "number") n = v;
-      else if (typeof v === "string") n = normalizeCurrencyUsd(v).usd;
-    } else {
-      n = normalizeNumberText(v);
-    }
-    if (!Number.isFinite(n)) continue;
-    if (min != null && n < min) continue;
-    if (max != null && n > max) continue;
-    return { path: h.path, value: n };
-  }
-  return { path: null, value: null };
-}
-
-function analyzePayloads(payloads) {
-  const wantedKeys = new Set(
-    [
-      "mau",
-      "monthlyactiveusers",
-      "downloads",
-      "storedownloads",
-      "store_downloads",
-      "totaldownloads",
-      "revenue",
-      "totalrevenue",
-      "revenueusd",
-      "rank",
-      "ranking",
-      "ranktext",
-      "rating",
-      "ratingavg",
-      "ratingscount",
-      "ratings_count",
-    ].map((k) => k.toLowerCase())
+function isTrackerUrl(url) {
+  const u = String(url || "").toLowerCase();
+  return (
+    u.includes("datadoghq.com") ||
+    u.includes("doubleclick") ||
+    u.includes("google-analytics") ||
+    u.includes("googletagmanager") ||
+    u.includes("segment") ||
+    u.includes("mixpanel") ||
+    u.includes("hotjar") ||
+    u.includes("sentry") ||
+    u.includes("datadog") ||
+    u.includes("amplitude")
   );
-
-  const scored = [];
-  for (const p of payloads) {
-    if (!p.body || typeof p.body !== "object") continue;
-    const hits = findKeyPaths(p.body, wantedKeys);
-    if (!hits.length) continue;
-
-    const byKey = new Map();
-    for (const h of hits) {
-      if (!byKey.has(h.key)) byKey.set(h.key, []);
-      byKey.get(h.key).push(h);
-    }
-
-    const mau = pickMetricFromHits([...(byKey.get("mau") || []), ...(byKey.get("monthlyactiveusers") || [])]);
-    const downloads = pickMetricFromHits([
-      ...(byKey.get("downloads") || []),
-      ...(byKey.get("store_downloads") || []),
-      ...(byKey.get("storedownloads") || []),
-      ...(byKey.get("totaldownloads") || []),
-    ]);
-    const revenue = pickMetricFromHits(
-      [...(byKey.get("totalrevenue") || []), ...(byKey.get("revenueusd") || []), ...(byKey.get("revenue") || [])],
-      { kind: "currency" }
-    );
-    const ratingAvg = pickMetricFromHits([...(byKey.get("ratingavg") || []), ...(byKey.get("rating") || [])], { min: 0, max: 5 });
-    const ratingsCount = pickMetricFromHits([...(byKey.get("ratingscount") || []), ...(byKey.get("ratings_count") || [])]);
-    const rankNum = pickMetricFromHits([...(byKey.get("rank") || []), ...(byKey.get("ranking") || [])]);
-
-    let rankText = null;
-    const rankTextHit = (byKey.get("ranktext") || []).find((h) => typeof h.value === "string" && h.value.trim());
-    if (rankTextHit) rankText = { path: rankTextHit.path, value: rankTextHit.value };
-    const rankingText = rankText?.value || (rankNum.value != null ? `#${rankNum.value}` : null);
-
-    const score = [mau.value, downloads.value, revenue.value, ratingAvg.value, ratingsCount.value, rankingText].filter((x) => x != null).length;
-    scored.push({
-      url: p.url,
-      score,
-      metrics: {
-        mau,
-        revenue_usd: revenue,
-        store_downloads: downloads,
-        rating_avg: ratingAvg,
-        ratings_count: ratingsCount,
-        ranking_text: rankText?.path ? { path: rankText.path, value: rankText.value } : { path: rankNum.path, value: rankingText },
-      },
-    });
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0] || null;
 }
 
-const METRIC_HINTS = [
-  "totalDownloads",
-  "storeDownloads",
-  "totalRevenue",
-  "revenueUsd",
-  "revenueUSD",
-  "mau",
-  "monthlyActiveUsers",
-  "ratingAvg",
-  "ratingsCount",
-  "ranking",
-  "rankText",
-  "Store Downloads",
-  "Total Revenue",
-  "MAU",
-];
-
-function textLooksLikeMetrics(t) {
-  if (!t) return false;
-  const s = String(t);
-  return METRIC_HINTS.some((h) => s.includes(h));
+function sha1(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex");
 }
 
-function extractFromTextHeuristics(t) {
-  const text = String(t || "");
-  const out = { mau: null, revenue_usd: null, store_downloads: null, rating_avg: null, ratings_count: null, ranking_text: null };
+function scoreBodyForTab(bodyText, tab) {
+  const t = String(bodyText || "");
+  const lower = t.toLowerCase();
 
-  const mDownloads = text.match(/"(?:totalDownloads|storeDownloads|store_downloads|total_downloads)"\s*:\s*\"?(-?\d+(?:\.\d+)?)\"?/);
-  if (mDownloads) out.store_downloads = Number(mDownloads[1]);
-
-  const mMau = text.match(/"(?:mau|monthlyActiveUsers)"\s*:\s*\"?(-?\d+(?:\.\d+)?)\"?/);
-  if (mMau) out.mau = Number(mMau[1]);
-
-  const mRev = text.match(/"(?:totalRevenue|revenueUsd|revenueUSD|revenue_usd)"\s*:\s*\"?(-?\d+(?:\.\d+)?)\"?/);
-  if (mRev) out.revenue_usd = Number(mRev[1]);
-
-  const mRankText = text.match(/"(?:rankText|rankingText)"\s*:\s*"([^"]+)"/);
-  if (mRankText) out.ranking_text = mRankText[1];
-
-  const mRankNum = text.match(/"(?:rank|ranking)"\s*:\s*\"?(\d+)\"?/);
-  if (!out.ranking_text && mRankNum) out.ranking_text = `#${mRankNum[1]}`;
-
-  const mRating = text.match(/"(?:ratingAvg|rating)"\s*:\s*\"?([0-5](?:\.\d+)?)\"?/);
-  if (mRating) out.rating_avg = Number(mRating[1]);
-
-  const mRatingsCount = text.match(/"(?:ratingsCount|ratings_count)"\s*:\s*\"?(\d+(?:\.\d+)?)\"?/);
-  if (mRatingsCount) out.ratings_count = Number(mRatingsCount[1]);
-
-  return out;
-}
-async function main() {
-  const argv = minimist(process.argv.slice(2), {
-    boolean: ["headless"],
-    string: ["url", "storage"],
-    default: {
-      headless: false,
-      url: "https://apps.similarweb.com/app-analysis/overview/apple/835599320?country=999&from=2026-01-01&to=2026-01-31&window=false",
-      storage: path.join(__dirname, "storageState.json"),
-    },
-  });
-
-  const targetUrl = String(argv.url);
-  const storageStatePath = String(argv.storage);
-
-  const logsDir = path.join(__dirname, "..", "logs");
-  await fs.mkdir(logsDir, { recursive: true });
-  const stamp = nowStampUtc();
-
-  const inspectPath = path.join(logsDir, `inspect_payloads_${stamp}.json`);
-  const inspectNonJsonPath = path.join(logsDir, `inspect_nonjson_${stamp}.json`);
-  const nextDataPath = path.join(logsDir, `next_data_${stamp}.json`);
-  const embeddedJsonPath = path.join(logsDir, `embedded_json_${stamp}.json`);
-  const pageHtmlPath = path.join(logsDir, `page_html_${stamp}.html`);
-  const xhrFetchPath = path.join(logsDir, `xhr_fetch_${stamp}.json`);
-    const rscReqPath = path.join(logsDir, rsc_requests_ + stamp + .json);
-
-  const interestingNeedles = [
-    "graphql",
-    "api",
-    "app-analysis",
-    "overview",
-    "metrics",
-    "download",
-    "revenue",
+  const needlesCommon = [
     "mau",
+    "monthlyactive",
+    "dau",
+    "wau",
+    "downloads",
+    "revenue",
+    "rank",
+    "rating",
+    "reply_rate",
+    "replyrate",
+    "sdk",
+    "audience",
+    "gender",
+    "age",
+    "sessions",
+    "stickiness",
   ];
 
-  const browser = await chromium.launch({ headless: Boolean(argv.headless) });
-  const captured = [];
-  const capturedNonJson = [];
+  const needlesByTab = {
+    overview: ["store downloads", "performance", "rank", "rating"],
+    usage_sessions: ["active users", "sessions", "stickiness", "dau", "wau", "mau"],
+    reviews: ["reply", "reviews"],
+    revenue: ["total revenue", "revenue"],
+    audience: ["gender", "age distribution", "female", "male"],
+    technographics: ["sdk", "installed", "technographics"],
+  };
 
-  const seenInteresting = [];
-  const allXhrFetch = [];
-  const rscRequests = [];
+  const needles = [...needlesCommon, ...(needlesByTab[tab] || [])];
+  let score = 0;
+  const hits = [];
+  for (const n of needles) {
+    if (lower.includes(n)) {
+      score += 1;
+      hits.push(n);
+    }
+  }
+  return { score, hits: hits.slice(0, 25) };
+}
 
+async function ensureDir(p) {
+  await fs.mkdir(p, { recursive: true });
+}
 
-  let mainDocStatus = null;
-  let mainDocCt = null;
+function pickSubsetHeaders(headers) {
+  const h = headers || {};
+  const out = {};
+  const keys = ["content-type", "cache-control", "location", "set-cookie", "x-request-id", "cf-ray", "server"];
+  for (const k of keys) {
+    const v = h[k] || h[k.toLowerCase()];
+    if (v != null) out[k] = v;
+  }
+  return out;
+}
 
-  let pageHtml = null;
-  let docExtracted = null;
-  try {
-    const context = await browser.newContext({ storageState: storageStatePath });
-    context.setDefaultTimeout(60_000);
-    const page = await context.newPage();
+function requestHeaderSubset(headers) {
+  const h = headers || {};
+  const keys = [
+    "accept",
+    "rsc",
+    "referer",
+    "origin",
+    "next-url",
+    "next-router-state-tree",
+    "next-router-prefetch",
+    "next-router-segment-prefetch",
+  ];
+  const out = {};
+  for (const k of keys) {
+    const v = h[k] || h[k.toLowerCase()];
+    if (v != null) out[k] = v;
+  }
+  return out;
+}
 
-    page.on("request", (req) => {
+function buildCapture() {
+  const entries = [];
+  const byId = new Map();
+  const idByReq = new WeakMap();
+  let nextId = 1;
+
+  function onRequest(req) {
+    const url = req.url();
+    const rt = req.resourceType();
+    const method = req.method();
+
+    let host = null;
+    try {
+      host = new URL(url).host;
+    } catch {
+      host = null;
+    }
+
+    const isDoc = rt === "document";
+    const isX = rt === "xhr" || rt === "fetch";
+
+    const isScriptMaybeData =
+      rt === "script" &&
+      isProbablyUsefulHost(host) &&
+      (url.includes("_next/data") || url.toLowerCase().includes("graphql") || url.toLowerCase().includes("/api/") || url.toLowerCase().endsWith(".json"));
+
+    if (!isDoc && !isX && !isScriptMaybeData) return;
+
+    if (isTrackerUrl(url) && !String(host || "").toLowerCase().endsWith("similarweb.com")) return;
+
+    const id = nextId++;
+    idByReq.set(req, id);
+
+    const h = req.headers();
+    const e = {
+      id,
+      url,
+      host,
+      method,
+      resource_type: rt,
+      request_headers: requestHeaderSubset(h),
+      started_at: new Date().toISOString(),
+      status: null,
+      response_content_type: null,
+      response_headers: null,
+      location: null,
+      body_snippet: null,
+      body_sha1: null,
+      body_truncated: null,
+      tab_score: null,
+      tab_hits: null,
+    };
+    entries.push(e);
+    byId.set(id, e);
+  }
+
+  function onResponse(resp, { tab } = {}) {
+    const task = (async () => {
+      const req = resp.request();
+      const id = idByReq.get(req);
+      if (!id) return;
+      const e = byId.get(id);
+      if (!e) return;
+
+      const status = resp.status();
+      const headers = resp.headers();
+      const ct = String(headers["content-type"] || headers["Content-Type"] || "");
+      const location = headers["location"] || headers["Location"] || null;
+
+      e.status = status;
+      e.response_content_type = ct || null;
+      e.location = location;
+      e.response_headers = pickSubsetHeaders(headers);
+
+      const hostLower = String(e.host || "").toLowerCase();
+      const shouldRead = isProbablyUsefulHost(hostLower);
+      if (!shouldRead) return;
+
+      const ctLower = ct.toLowerCase();
+      const isTextLike =
+        ctLower.includes("application/json") ||
+        ctLower.includes("text/") ||
+        ctLower.includes("text/x-component") ||
+        ctLower.includes("application/graphql") ||
+        e.url.toLowerCase().includes("graphql") ||
+        e.url.toLowerCase().includes("_rsc=") ||
+        e.url.toLowerCase().includes("_next/data") ||
+        e.url.toLowerCase().includes("/api/") ||
+        e.url.toLowerCase().endsWith(".json");
+
+      if (!isTextLike) return;
+
+      let text = null;
       try {
-        const url = req.url();
-        const rt = req.resourceType();
-        const headers = req.headers();
-        const lower = url.toLowerCase();
-        if (rt === "xhr" || rt === "fetch") {
-          if (allXhrFetch.length < 800) {
-            allXhrFetch.push({
-              url,
-              resource_type: rt,
-              method: req.method(),
-              host: (() => {
-                try {
-                  return new URL(url).host;
-                } catch {
-                  return null;
-                }
-              })(),
-            });
-          }
-        }
-
-        const accept = String(headers[ accept] || );
- const isRscReq =
- String(headers[rsc] || ) === 1 ||
-          accept.toLowerCase().includes(text/x-component) ||
-          lower.includes(_rsc=);
-
-        if (isRscReq && rscRequests.length < 400) {
-          rscRequests.push({
-            url,
-            resource_type: rt,
-            method: req.method(),
-            headers: {
-              accept: headers[accept] || null,
-              rsc: headers[rsc] || null,
-              referer: headers[referer] || null,
-              origin: headers[origin] || null,
-              next-url: headers[next-url] || null,
-              next-router-state-tree: headers[next-router-state-tree] || null,
-              next-router-prefetch: headers[next-router-prefetch] || null,
-              next-router-segment-prefetch: headers[next-router-segment-prefetch] || null,
-            },
-            postDataSnippet: (() => {
-              try {
-                const pd = req.postData();
-                if (!pd) return null;
-                return pd.length > 2000 ? pd.slice(0, 2000) : pd;
-              } catch {
-                return null;
-              }
-            })(),
-          });
-        }
-        if (interestingNeedles.some((n) => lower.includes(n))) {
-          seenInteresting.push({ url, resource_type: rt, method: req.method() });
-          if (seenInteresting.length <= 80) {
-            process.stdout.write(`[req] ${rt} ${req.method()} ${url}\n`);
-          }
-        }
+        text = await resp.text();
       } catch {
-        // ignore
+        text = null;
       }
-    });
+      if (!text) return;
 
-    const responseTasks = new Set();
-    page.on("response", (resp) => {
-      const task = (async () => {
-        const url = resp.url();
-        const status = resp.status();
-        const headers = resp.headers();
-        const ct = String(headers["content-type"] || headers["Content-Type"] || "");
-        const lowerUrl = url.toLowerCase();
+      e.body_sha1 = sha1(text);
+      e.body_truncated = text.length > 300;
+      e.body_snippet = text.slice(0, 300);
 
-        if (lowerUrl === targetUrl.toLowerCase()) {
-          mainDocStatus = status;
-          mainDocCt = ct;
-          try {
-            pageHtml = await resp.text();
-          } catch {
-            pageHtml = null;
-          }
-        }
+      if (tab) {
+        const scored = scoreBodyForTab(text, tab);
+        e.tab_score = scored.score;
+        e.tab_hits = scored.hits;
+      }
+    })();
 
-        const isJson = ct.toLowerCase().includes("application/json") || lowerUrl.includes("graphql");
-        const isRsc = ct.toLowerCase().includes("text/x-component") || lowerUrl.includes("_rsc=");
-        const isFetchLike = resp.request().resourceType() === "xhr" || resp.request().resourceType() === "fetch";
+    return task;
+  }
 
-        if (!isJson && !isRsc && !isFetchLike) return;
+  return { entries, onRequest, onResponse };
+}
 
-        let body = null;
-        let text = null;
+async function runOneTab({ context, tab, url, logsDir, stamp, headless }) {
+  const page = await context.newPage();
+  page.setDefaultTimeout(60_000);
+
+  const capture = buildCapture();
+  const responseTasks = new Set();
+
+  page.on("request", (req) => {
+    try {
+      capture.onRequest(req);
+      const u = req.url();
+      const rt = req.resourceType();
+      const host = (() => {
         try {
-          body = await resp.json();
+          return new URL(u).host;
         } catch {
-          try {
-            text = await resp.text();
-            const trimmed = String(text || "").trim();
-            if (trimmed.startsWith("{") || trimmed.startsWith("[")) body = JSON.parse(trimmed);
-          } catch {
-            body = null;
-          }
-        }
-
-        const bodyStr = body != null ? safeStringify(body) : text;
-        const snippet = bodyStr ? String(bodyStr).slice(0, 2000) : null;
-
-        captured.push({
-          url,
-          status,
-          headers,
-          body_snippet: snippet,
-          body_full_if_small: bodyStr && bodyStr.length <= 200_000 ? bodyStr : null,
-          body: body && safeStringify(body).length <= 200_000 ? body : null,
-        });
-
-        if (captured.length <= 20) {
-          process.stdout.write(`[json] ${status} ${url}\n`);
+          return "";
         }
       })();
+      const lower = u.toLowerCase();
+      const interesting =
+        isProbablyUsefulHost(host) &&
+        (rt === "xhr" || rt === "fetch" || rt === "document") &&
+        (lower.includes("app-analysis") || lower.includes("_rsc=") || lower.includes("graphql") || lower.includes("/api/") || lower.includes("_next/data"));
+      if (interesting) process.stdout.write(`[req:${tab}] ${rt} ${req.method()} ${u}\n`);
+    } catch {}
+  });
 
-      responseTasks.add(task);
-      void task.finally(() => responseTasks.delete(task)).catch(() => {});
-    });
+  page.on("response", (resp) => {
+    const t = capture.onResponse(resp, { tab });
+    if (t) responseTasks.add(t);
+    if (t) t.finally(() => responseTasks.delete(t));
+  });
 
-    process.stdout.write(`\nOpening (Jan 2026 only): ${targetUrl}\n\n`);
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
-    await page.waitForTimeout(8000);
-    await Promise.allSettled(Array.from(responseTasks));
+  const debugBase = `debug_${tab}_${stamp}`;
+  const logPath = path.join(logsDir, `${debugBase}.log`);
+  const htmlPath = path.join(logsDir, `${debugBase}.html`);
+  const pngPath = path.join(logsDir, `${debugBase}.png`);
+  const netPath = path.join(logsDir, `xhr_fetch_${stamp}_${tab}.json`);
 
-    // Dump all xhr/fetch requests (even if they don't match interesting needles)
-    const uniq = new Map();
-    for (const r of allXhrFetch) {
-      if (!uniq.has(r.url)) uniq.set(r.url, r);
-    }
-    await fs.writeFile(xhrFetchPath, JSON.stringify(Array.from(uniq.values()), null, 2) + "\n", "utf8");
-    await fs.writeFile(rscReqPath, safeStringify(rscRequests, null, 2) || [], utf8);
+  const stages = [];
+  stages.push({ event: "debug_start", at: new Date().toISOString(), tab, url, headless });
 
-    if (pageHtml) {
-      await fs.writeFile(pageHtmlPath, String(pageHtml), "utf8");
-      const heur = extractFromTextHeuristics(pageHtml);
-      const score = [heur.mau, heur.revenue_usd, heur.store_downloads, heur.ranking_text, heur.rating_avg, heur.ratings_count].filter((x) => x != null)
-        .length;
-      docExtracted = { score, extracted: heur, has_metric_hints: textLooksLikeMetrics(pageHtml) };
-    }
+  let gotoStatus = null;
+  let finalUrl = null;
+  let title = null;
+  let markers = null;
 
-    // __NEXT_DATA__
-    let nextData = null;
-    try {
-      nextData = await page.evaluate(() => {
-        // @ts-ignore
-        if (typeof window !== "undefined" && window.__NEXT_DATA__) return window.__NEXT_DATA__;
-        const el = document.querySelector("script#__NEXT_DATA__");
-        if (el && el.textContent) {
-          try {
-            return JSON.parse(el.textContent);
-          } catch {
-            return null;
-          }
-        }
-        return null;
-      });
-    } catch {
-      nextData = null;
-    }
-    if (nextData) await fs.writeFile(nextDataPath, JSON.stringify(nextData, null, 2) + "\n", "utf8");
+  try {
+    stages.push({ event: "goto_start", at: new Date().toISOString(), url });
+    const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    gotoStatus = resp ? resp.status() : null;
+    await page.waitForLoadState("networkidle", { timeout: 90_000 }).catch(() => {});
+    await page.waitForTimeout(2500);
 
-    // Embedded JSON scripts
-    let embedded = [];
-    try {
-      embedded = await page.evaluate(() => {
-        const els = Array.from(document.querySelectorAll('script[type="application/json"]'));
-        return els.slice(0, 50).map((el) => {
-          const txt = el.textContent || "";
-          const id = el.getAttribute("id");
-          const len = txt.length;
-          let parsed = null;
-          if (txt && len <= 300_000) {
-            try {
-              parsed = JSON.parse(txt);
-            } catch {
-              parsed = null;
-            }
-          }
-          return { id, len, text_snippet: txt.slice(0, 2000), parsed };
-        });
-      });
-    } catch {
-      embedded = [];
-    }
-    if (embedded && embedded.length) await fs.writeFile(embeddedJsonPath, JSON.stringify(embedded, null, 2) + "\n", "utf8");
+    finalUrl = page.url();
+    title = await page.title().catch(() => null);
 
-    // Save captured payloads
-    const out = captured.map((p) => ({
-      url: p.url,
-      status: p.status,
-      headers: p.headers,
-      body_snippet: p.body_snippet,
-      body_full_if_small: p.body_full_if_small,
-    }));
-    await fs.writeFile(inspectPath, JSON.stringify(out, null, 2) + "\n", "utf8");
-
-    // Analyze
-    const payloadObjs = [];
-    for (const p of captured) {
-      if (p.body != null) payloadObjs.push({ url: p.url, body: p.body });
-      else if (p.body_full_if_small) {
-        try {
-          const parsed = JSON.parse(p.body_full_if_small);
-          payloadObjs.push({ url: p.url, body: parsed });
-        } catch {
-          // ignore
-        }
-      }
-    }
-    if (nextData) payloadObjs.push({ url: "__NEXT_DATA__", body: nextData });
-    for (const e of embedded || []) {
-      if (e.parsed) payloadObjs.push({ url: `__EMBEDDED_JSON__:${e.id || "(no-id)"}`, body: e.parsed });
-    }
-
-    const best = analyzePayloads(payloadObjs);
-    const bestTextCandidate = capturedNonJson
-      .filter((p) => p && p.extracted)
-      .map((p) => {
-        const m = p.extracted;
-        const score = [m.mau, m.revenue_usd, m.store_downloads, m.ranking_text, m.rating_avg, m.ratings_count].filter((x) => x != null).length;
-        return { url: p.url, kind: p.kind, score, extracted: m };
-      })
-      .sort((a, b) => b.score - a.score)[0] || null;
-
-    const rendered = await page.evaluate(() => {
-      const t = (document && document.body ? document.body.innerText : "") || "";
-      const hasLabel = /store\s+downloads/i.test(t) || /total\s+revenue/i.test(t) || /\bMAU\b/.test(t);
-      const hasNumber = /\$\s*\d|#\s*\d|\b\d[\d,]*(?:\.\d+)?\s*[KMB]?\b/.test(t);
-      return { hasLabel, hasNumber, text_sample: t.slice(0, 600) };
-    });
-
-    const blockedSignals = {
-      main_doc_status: mainDocStatus,
-      main_doc_content_type: mainDocCt,
-      has_login_text: rendered.text_sample.toLowerCase().includes("sign in") || rendered.text_sample.toLowerCase().includes("login"),
-      has_captcha_text: rendered.text_sample.toLowerCase().includes("captcha") || rendered.text_sample.toLowerCase().includes("access denied"),
+    const bodyText = await page.evaluate(() => (document && document.body ? document.body.innerText : "") || "");
+    const lower = bodyText.toLowerCase();
+    markers = {
+      internal_server_error: lower.includes("internal server error"),
+      sign_in: lower.includes("sign in") || lower.includes("login"),
+      upgrade: lower.includes("upgrade") || lower.includes("plan"),
+      access_denied: lower.includes("access denied") || lower.includes("forbidden") || lower.includes("not authorized"),
+      has_403: lower.includes("403"),
     };
 
-    const topUrls = Array.from(
-      new Map(seenInteresting.map((x) => [x.url, x])).values()
-    ).slice(0, 20);
+    const html = await page.content();
+    await fs.writeFile(htmlPath, html, "utf8");
+    await page.screenshot({ path: pngPath, fullPage: true }).catch(() => {});
 
+    stages.push({ event: "goto_done", at: new Date().toISOString(), status: gotoStatus, final_url: finalUrl, title, markers });
+
+    await Promise.allSettled(Array.from(responseTasks));
+
+    await fs.writeFile(
+      netPath,
+      safeStringify({ tab, url, gotoStatus, finalUrl, title, markers, entries: capture.entries }) || "{}",
+      "utf8"
+    );
+
+    const scored = capture.entries
+      .filter((e) => e && typeof e.tab_score === "number" && e.tab_score > 0 && e.body_snippet)
+      .map((e) => ({ url: e.url, status: e.status, ct: e.response_content_type, score: e.tab_score, hits: e.tab_hits, snippet: e.body_snippet }))
+      .sort((a, b) => b.score - a.score);
+
+    const best = scored[0] || null;
+    stages.push({ event: "best_candidate", at: new Date().toISOString(), best });
+
+    await fs.writeFile(logPath, safeStringify({ tab, url, stages }, 2) || "{}", "utf8");
+
+    process.stdout.write(`\n[tab:${tab}] status=${gotoStatus} title=${title || ""}\n`);
     if (best) {
-      process.stdout.write("\nSummary\n");
-      process.stdout.write(`- Best candidate endpoint: ${best.url}\n`);
-      process.stdout.write(`- JSON path for mau: ${best.metrics.mau.path || "(not found)"}\n`);
-      process.stdout.write(`- JSON path for revenue: ${best.metrics.revenue_usd.path || "(not found)"}\n`);
-      process.stdout.write(`- JSON path for downloads: ${best.metrics.store_downloads.path || "(not found)"}\n`);
-      process.stdout.write(`- JSON path for ranking: ${best.metrics.ranking_text.path || "(not found)"}\n`);
-      process.stdout.write(`- JSON path for rating_avg: ${best.metrics.rating_avg.path || "(not found)"}\n`);
-      process.stdout.write(`- JSON path for ratings_count: ${best.metrics.ratings_count.path || "(not found)"}\n`);
-    } else if (bestTextCandidate && bestTextCandidate.score > 0) {
-      process.stdout.write("\nSummary (from RSC/text response)\n");
-      process.stdout.write(`- Best candidate endpoint: ${bestTextCandidate.url} (${bestTextCandidate.kind})\n`);
-      process.stdout.write(`- mau (regex): ${bestTextCandidate.extracted.mau ?? "(not found)"}\n`);
-      process.stdout.write(`- revenue_usd (regex): ${bestTextCandidate.extracted.revenue_usd ?? "(not found)"}\n`);
-      process.stdout.write(`- downloads (regex): ${bestTextCandidate.extracted.store_downloads ?? "(not found)"}\n`);
-      process.stdout.write(`- ranking_text (regex): ${bestTextCandidate.extracted.ranking_text ?? "(not found)"}\n`);
-      process.stdout.write(`- rating_avg (regex): ${bestTextCandidate.extracted.rating_avg ?? "(not found)"}\n`);
-      process.stdout.write(`- ratings_count (regex): ${bestTextCandidate.extracted.ratings_count ?? "(not found)"}\n`);
+      process.stdout.write(`[tab:${tab}] Best data-ish response: score=${best.score} status=${best.status} ct=${best.ct || ""}\n`);
+      process.stdout.write(`[tab:${tab}] URL: ${best.url}\n`);
+      process.stdout.write(`[tab:${tab}] hits: ${JSON.stringify(best.hits)}\n`);
+      process.stdout.write(`[tab:${tab}] snippet: ${String(best.snippet).replace(/\s+/g, " ").slice(0, 200)}\n`);
     } else {
-      process.stdout.write("\nMetrics not found in JSON/Next/embedded.\n");
-      process.stdout.write(`- Rendered visually? labels=${rendered.hasLabel} numbers=${rendered.hasNumber}\n`);
-      process.stdout.write(`- Blocked signals: ${JSON.stringify(blockedSignals)}\n`);
-      process.stdout.write("- Top 20 interesting URLs:\n");
-      for (const u of topUrls) process.stdout.write(`  - ${u.resource_type} ${u.method} ${u.url}\n`);
-
-      const uniqX = Array.from(new Map(allXhrFetch.map((x) => [x.url, x])).values()).slice(0, 20);
-      process.stdout.write("- Top 20 xhr/fetch URLs:\n");
-      for (const u of uniqX) process.stdout.write(`  - ${u.resource_type} ${u.method} ${u.url}\n`);
-
-      if (docExtracted) {
-        process.stdout.write(`- Document HTML hints: has_metric_hints=${docExtracted.has_metric_hints} score=${docExtracted.score}\n`);
-        process.stdout.write(`- Document HTML extracted (regex): ${JSON.stringify(docExtracted.extracted)}\n`);
-      }
+      process.stdout.write(`[tab:${tab}] No obvious data response found (only shells/tracking). See ${path.relative(process.cwd(), netPath)}\n`);
     }
 
-    process.stdout.write("\nArtifacts\n");
-    process.stdout.write(`- ${path.relative(process.cwd(), inspectPath)}\n`);
-    process.stdout.write(`- ${path.relative(process.cwd(), inspectNonJsonPath)}\n`);
-    process.stdout.write(`- ${path.relative(process.cwd(), xhrFetchPath)}\n`);
-    process.stdout.write(- \n);
-    if (pageHtml) process.stdout.write(`- ${path.relative(process.cwd(), pageHtmlPath)}\n`);
-    if (nextData) process.stdout.write(`- ${path.relative(process.cwd(), nextDataPath)}\n`);
-    if (embedded && embedded.length) process.stdout.write(`- ${path.relative(process.cwd(), embeddedJsonPath)}\n`);
+    process.stdout.write(`Artifacts: ${path.relative(process.cwd(), logPath)} | ${path.relative(process.cwd(), htmlPath)} | ${path.relative(process.cwd(), pngPath)} | ${path.relative(process.cwd(), netPath)}\n`);
+  } catch (err) {
+    const msg = String(err && err.stack ? err.stack : err);
+    stages.push({ event: "error", at: new Date().toISOString(), message: msg });
+    await Promise.allSettled(Array.from(responseTasks));
+    await fs.writeFile(netPath, safeStringify({ tab, url, gotoStatus, finalUrl, title, markers, entries: capture.entries, error: msg }) || "{}", "utf8");
+    await fs.writeFile(logPath, safeStringify({ tab, url, stages }, 2) || "{}", "utf8");
+    process.stdout.write(`\n[tab:${tab}] ERROR: ${msg}\n`);
+    process.stdout.write(`Artifacts: ${path.relative(process.cwd(), logPath)} | ${path.relative(process.cwd(), netPath)}\n`);
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
 
-    // keep browser open briefly in headful mode so user can see UI
-    if (!argv.headless) {
-      process.stdout.write("\nClose the browser window to end.\n");
-      await page.waitForEvent("close", { timeout: 0 }).catch(() => {});
+async function main() {
+  const argv = minimist(process.argv.slice(2));
+
+  const headless = Boolean(argv.headless);
+  const urlArg = argv.url ? String(argv.url) : null;
+
+  const appId = argv.app_id != null ? String(argv.app_id) : null;
+  const store = argv.store != null ? String(argv.store) : "apple";
+  const country = argv.country != null ? Number(argv.country) : 999;
+
+  let from = argv.from != null ? String(argv.from) : null;
+  let to = argv.to != null ? String(argv.to) : null;
+  if (!from || !to) {
+    const month = argv.month != null ? String(argv.month) : "2026-01";
+    const r = monthToRange(month);
+    from = from || r.from;
+    to = to || r.to;
+  }
+
+  const tabsArg = argv.tabs != null ? String(argv.tabs) : null;
+  const tabSingle = argv.tab != null ? String(argv.tab) : null;
+
+  let targets = [];
+  if (urlArg) {
+    const inferredTab = (() => {
+      const u = urlArg.toLowerCase();
+      if (u.includes("/overview/")) return "overview";
+      if (u.includes("/usage-and-engagement/")) return "usage_sessions";
+      if (u.includes("/reviews/")) return "reviews";
+      if (u.includes("/revenue/")) return "revenue";
+      if (u.includes("/audience-analysis/")) return "audience";
+      if (u.includes("/technographics/")) return "technographics";
+      return "custom";
+    })();
+    targets = [{ tab: inferredTab, url: urlArg }];
+  } else {
+    if (!appId) throw new Error("Provide either --url or --app_id");
+
+    let tabs = [];
+    if (tabsArg) tabs = tabsArg.split(",").map((x) => x.trim()).filter(Boolean);
+    else if (tabSingle) tabs = tabSingle.split(",").map((x) => x.trim()).filter(Boolean);
+    else tabs = ["overview"]; // default
+
+    if (tabs.includes("all")) {
+      tabs = ["overview", "usage_sessions", "reviews", "revenue", "audience", "technographics"];
     }
+
+    for (const tab of tabs) {
+      const url = buildTabUrl({ tab, store, id: appId, country, from, to });
+      targets.push({ tab, url });
+    }
+  }
+
+  const storageStatePath = path.join(__dirname, "storageState.json");
+  const logsDir = path.join(process.cwd(), "logs");
+  await ensureDir(logsDir);
+
+  const stamp = nowStampUtc();
+
+  const browser = await chromium.launch({ headless });
+  try {
+    const context = await browser.newContext({ storageState: storageStatePath });
+
+    process.stdout.write(`Headless=${headless} | country=${country} | from=${from} | to=${to}\n`);
+    process.stdout.write(`Targets: ${targets.map((t) => t.tab).join(", ")}\n\n`);
+
+    for (const t of targets) {
+      await runOneTab({ context, tab: t.tab, url: t.url, logsDir, stamp, headless });
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+
+    await context.close().catch(() => {});
   } finally {
     await browser.close().catch(() => {});
   }
@@ -616,9 +478,3 @@ main().catch((err) => {
   process.stderr.write(String(err && err.stack ? err.stack : err) + "\n");
   process.exit(1);
 });
-
-
-
-
-
-
