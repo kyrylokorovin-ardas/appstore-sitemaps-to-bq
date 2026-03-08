@@ -85,6 +85,40 @@ function sha1(s) {
   return crypto.createHash("sha1").update(String(s)).digest("hex");
 }
 
+function computeDataScore({ url, contentType, bodySnippet, tabScore }) {
+  const u = String(url || "").toLowerCase();
+  const ct = String(contentType || "").toLowerCase();
+  const snip = String(bodySnippet || "");
+  const snipLower = snip.toLowerCase();
+
+  let score = Number.isFinite(tabScore) ? tabScore : 0;
+
+  // Prefer machine payloads over HTML documents.
+  if (ct.includes("application/json")) score += 50;
+  if (ct.includes("text/x-component")) score += 25;
+  if (ct.includes("application/graphql")) score += 30;
+
+  // URL hints.
+  if (u.includes("graphql")) score += 20;
+  if (u.includes("_rsc=")) score += 15;
+  if (u.includes("/_next/data")) score += 12;
+  if (u.includes("/api/")) score += 12;
+
+  // Penalize HTML shell.
+  const isHtml = snipLower.startsWith("<!doctype html") || snipLower.startsWith("<html");
+  if (ct.includes("text/html")) score -= 40;
+  if (isHtml) score -= 40;
+
+  // Penalize common RSC loading-only shells.
+  const looksLikeRsc = snip.includes('$Sreact.fragment') || snip.includes('"$Sreact.fragment"');
+  const looksLikeLoading = snipLower.includes("/loading-") || snipLower.includes("loading-");
+  if (looksLikeRsc && looksLikeLoading && (Number.isFinite(tabScore) ? tabScore : 0) <= 2) score -= 25;
+
+  // Reward presence of digits (likely real values).
+  if (/\d/.test(snip)) score += 2;
+
+  return score;
+}
 function scoreBodyForTab(bodyText, tab) {
   const t = String(bodyText || "");
   const lower = t.toLowerCase();
@@ -215,6 +249,9 @@ function buildCapture() {
       body_truncated: null,
       tab_score: null,
       tab_hits: null,
+      data_score: null,
+      is_html_snippet: null,
+      rsc_request_hint: null,
     };
     entries.push(e);
     byId.set(id, e);
@@ -267,12 +304,16 @@ function buildCapture() {
       e.body_sha1 = sha1(text);
       e.body_truncated = text.length > 300;
       e.body_snippet = text.slice(0, 300);
+      const snipLower = String(e.body_snippet || "").toLowerCase();
+      e.is_html_snippet = snipLower.startsWith("<!doctype html") || snipLower.startsWith("<html");
 
       if (tab) {
         const scored = scoreBodyForTab(text, tab);
         e.tab_score = scored.score;
         e.tab_hits = scored.hits;
       }
+
+      e.data_score = computeDataScore({ url: e.url, contentType: e.response_content_type, bodySnippet: e.body_snippet, tabScore: e.tab_score });
     })();
 
     return task;
@@ -363,22 +404,42 @@ async function runOneTab({ context, tab, url, logsDir, stamp, headless }) {
       "utf8"
     );
 
-    const scored = capture.entries
-      .filter((e) => e && typeof e.tab_score === "number" && e.tab_score > 0 && e.body_snippet)
-      .map((e) => ({ url: e.url, status: e.status, ct: e.response_content_type, score: e.tab_score, hits: e.tab_hits, snippet: e.body_snippet }))
-      .sort((a, b) => b.score - a.score);
+        const candidates = capture.entries
+      .filter((e) => e && e.body_snippet && typeof e.data_score === "number")
+      .map((e) => ({
+        url: e.url,
+        status: e.status,
+        ct: e.response_content_type,
+        data_score: e.data_score,
+        tab_score: e.tab_score,
+        hits: e.tab_hits,
+        is_html: Boolean(e.is_html_snippet),
+        rsc_hint: Boolean(e.rsc_request_hint),
+        snippet: e.body_snippet,
+      }))
+      .sort((a, b) => (b.data_score || 0) - (a.data_score || 0));
 
-    const best = scored[0] || null;
-    stages.push({ event: "best_candidate", at: new Date().toISOString(), best });
+    const bestNonHtml = candidates.find((c) => !c.is_html) || null;
+    const best = bestNonHtml || candidates[0] || null;
+    const top5 = candidates.slice(0, 5);
+    stages.push({ event: "best_candidate", at: new Date().toISOString(), best, top5 });
 
     await fs.writeFile(logPath, safeStringify({ tab, url, stages }, 2) || "{}", "utf8");
 
     process.stdout.write(`\n[tab:${tab}] status=${gotoStatus} title=${title || ""}\n`);
-    if (best) {
-      process.stdout.write(`[tab:${tab}] Best data-ish response: score=${best.score} status=${best.status} ct=${best.ct || ""}\n`);
+        if (best) {
+      process.stdout.write(`[tab:${tab}] Best candidate: data_score=${best.data_score} tab_score=${best.tab_score ?? 0} status=${best.status} ct=${best.ct || ""} rsc_hint=${best.rsc_hint} is_html=${best.is_html}\n`);
       process.stdout.write(`[tab:${tab}] URL: ${best.url}\n`);
       process.stdout.write(`[tab:${tab}] hits: ${JSON.stringify(best.hits)}\n`);
       process.stdout.write(`[tab:${tab}] snippet: ${String(best.snippet).replace(/\s+/g, " ").slice(0, 200)}\n`);
+
+      const top = (top5 || []).slice(0, 3);
+      if (top.length) {
+        process.stdout.write(`[tab:${tab}] Top candidates:\n`);
+        for (const c of top) {
+          process.stdout.write(`  - data_score=${c.data_score} tab_score=${c.tab_score ?? 0} status=${c.status} ct=${c.ct || ""} rsc_hint=${c.rsc_hint} is_html=${c.is_html} url=${c.url}\n`);
+        }
+      }
     } else {
       process.stdout.write(`[tab:${tab}] No obvious data response found (only shells/tracking). See ${path.relative(process.cwd(), netPath)}\n`);
     }
@@ -478,3 +539,6 @@ main().catch((err) => {
   process.stderr.write(String(err && err.stack ? err.stack : err) + "\n");
   process.exit(1);
 });
+
+
+
