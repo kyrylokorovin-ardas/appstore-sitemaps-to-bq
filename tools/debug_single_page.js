@@ -276,6 +276,7 @@ async function main() {
   const embeddedJsonPath = path.join(logsDir, `embedded_json_${stamp}.json`);
   const pageHtmlPath = path.join(logsDir, `page_html_${stamp}.html`);
   const xhrFetchPath = path.join(logsDir, `xhr_fetch_${stamp}.json`);
+    const rscReqPath = path.join(logsDir, rsc_requests_ + stamp + .json);
 
   const interestingNeedles = [
     "graphql",
@@ -294,6 +295,7 @@ async function main() {
 
   const seenInteresting = [];
   const allXhrFetch = [];
+  const rscRequests = [];
 
 
   let mainDocStatus = null;
@@ -310,9 +312,56 @@ async function main() {
       try {
         const url = req.url();
         const rt = req.resourceType();
+        const headers = req.headers();
         const lower = url.toLowerCase();
         if (rt === "xhr" || rt === "fetch") {
-          if (allXhrFetch.length < 800) allXhrFetch.push({ url, resource_type: rt, method: req.method() });
+          if (allXhrFetch.length < 800) {
+            allXhrFetch.push({
+              url,
+              resource_type: rt,
+              method: req.method(),
+              host: (() => {
+                try {
+                  return new URL(url).host;
+                } catch {
+                  return null;
+                }
+              })(),
+            });
+          }
+        }
+
+        const accept = String(headers[ accept] || );
+ const isRscReq =
+ String(headers[rsc] || ) === 1 ||
+          accept.toLowerCase().includes(text/x-component) ||
+          lower.includes(_rsc=);
+
+        if (isRscReq && rscRequests.length < 400) {
+          rscRequests.push({
+            url,
+            resource_type: rt,
+            method: req.method(),
+            headers: {
+              accept: headers[accept] || null,
+              rsc: headers[rsc] || null,
+              referer: headers[referer] || null,
+              origin: headers[origin] || null,
+              next-url: headers[next-url] || null,
+              next-router-state-tree: headers[next-router-state-tree] || null,
+              next-router-prefetch: headers[next-router-prefetch] || null,
+              next-router-segment-prefetch: headers[next-router-segment-prefetch] || null,
+            },
+            postDataSnippet: (() => {
+              try {
+                const pd = req.postData();
+                if (!pd) return null;
+                return pd.length > 2000 ? pd.slice(0, 2000) : pd;
+              } catch {
+                return null;
+              }
+            })(),
+          });
         }
         if (interestingNeedles.some((n) => lower.includes(n))) {
           seenInteresting.push({ url, resource_type: rt, method: req.method() });
@@ -397,6 +446,7 @@ async function main() {
       if (!uniq.has(r.url)) uniq.set(r.url, r);
     }
     await fs.writeFile(xhrFetchPath, JSON.stringify(Array.from(uniq.values()), null, 2) + "\n", "utf8");
+    await fs.writeFile(rscReqPath, safeStringify(rscRequests, null, 2) || [], utf8);
 
     if (pageHtml) {
       await fs.writeFile(pageHtmlPath, String(pageHtml), "utf8");
@@ -547,6 +597,7 @@ async function main() {
     process.stdout.write(`- ${path.relative(process.cwd(), inspectPath)}\n`);
     process.stdout.write(`- ${path.relative(process.cwd(), inspectNonJsonPath)}\n`);
     process.stdout.write(`- ${path.relative(process.cwd(), xhrFetchPath)}\n`);
+    process.stdout.write(- \n);
     if (pageHtml) process.stdout.write(`- ${path.relative(process.cwd(), pageHtmlPath)}\n`);
     if (nextData) process.stdout.write(`- ${path.relative(process.cwd(), nextDataPath)}\n`);
     if (embedded && embedded.length) process.stdout.write(`- ${path.relative(process.cwd(), embeddedJsonPath)}\n`);
